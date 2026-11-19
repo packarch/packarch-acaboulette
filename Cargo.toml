@@ -1,0 +1,19 @@
+[package]
+name = "packarch-acaboulette"
+version = "1.0.0"
+edition = "2024"
+description = "Acaboulette : un gros matou roux ecrabouille les pigeons de Bordeaux, jeu d'arcade gore pour Packarch"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/packarch/packarch-acaboulette"
+authors = ["Fabrice Corraire <antidote1911@gmail.com>"]
+
+[dependencies]
+macroquad = "0.4"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

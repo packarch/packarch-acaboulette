@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Acaboulette
+GenericName=Jeu d'arcade
+Comment=Un gros matou roux traverse Bordeaux et ecrabouille pigeons, rats et chiens
+Exec=packarch-acaboulette
+Icon=packarch-acaboulette
+Terminal=false
+Categories=Game;ArcadeGame;
+Keywords=jeu;chat;bordeaux;pigeon;tram;gore;
