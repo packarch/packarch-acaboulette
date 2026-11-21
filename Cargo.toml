@@ -1,6 +1,6 @@
 [package]
 name = "packarch-acaboulette"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "Acaboulette : un gros matou roux ecrabouille les pigeons de Bordeaux, jeu d'arcade gore pour Packarch"
 license = "GPL-3.0-or-later"
