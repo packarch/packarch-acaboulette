@@ -4,9 +4,14 @@
 //!
 //! Commandes :
 //!   Espace / clic / fleche haut   : sauter (double saut ; maintenir = plus haut)
+//!                                   3e saut : deltaplane, chaque clic redresse le nez
 //!   Fleche bas / S / clic droit   : plat ventre (en l'air) : BADABOUM
+//!   Dans le char d'assaut           : clic gauche = obus, clic droit = missiles
 //!   G                             : activer / desactiver le gore
 //!   Echap                         : quitter
+
+// Pas de console qui s'ouvre derriere le jeu sous Windows (en release).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use macroquad::prelude::*;
 use macroquad::rand::gen_range;
@@ -22,6 +27,21 @@ const GRAV: f32 = 34.0;
 const JUMP_V: f32 = 13.0;
 const HOLD_FACTOR: f32 = 0.62; // gravite reduite tant qu'on maintient le saut
 const SLAM_V: f32 = -28.0;
+const TANK_TIME: f32 = 14.0; // duree d'un tour en char d'assaut
+const TANK_SPEED: f32 = 6.5; // le char ne roule pas trop vite
+const TANK_LEN: f32 = 4.6;
+const TANK_H: f32 = 2.1;
+const TANK_SEAT: f32 = 1.8; // position du chat depuis l'arriere du char
+const TANK_MIN_X: f32 = 250.0; // pas de char avant cette distance
+const TANK_EVERY: f32 = 400.0; // distance minimale entre deux chars
+const TANK_CHANCE: f32 = 0.06;
+const SHELL_SPEED: f32 = 42.0;
+const SHELL_CD: f32 = 0.7;
+const MISSILE_CD: f32 = 1.4;
+const MISSILE_N: usize = 5;
+const GLIDE_MAX: f32 = 4.0; // duree du vol en deltaplane (le 3e saut)
+const GLIDE_GRAV: f32 = 9.0; // gravite sous l'aile
+const GLIDE_FLARE_COST: f32 = 0.3; // chaque coup de nez raccourcit le vol
 const START_SPEED: f32 = 7.5;
 const MAX_SPEED: f32 = 15.0;
 const SPEED_GAIN: f32 = 0.07; // m/s gagnes chaque seconde
@@ -57,9 +77,17 @@ const STONE: Color = Color::new(0.89, 0.81, 0.63, 1.0); // pierre blonde de Bord
 const STONE_SHADE: Color = Color::new(0.76, 0.67, 0.5, 1.0);
 const STONE_DARK: Color = Color::new(0.6, 0.52, 0.38, 1.0);
 const SLATE: Color = Color::new(0.33, 0.37, 0.45, 1.0);
-const GARONNE: Color = Color::new(0.58, 0.47, 0.32, 1.0); // couleur cafe au lait
+const GARONNE: Color = Color::new(0.58, 0.47, 0.32, 1.0); // couleur café au lait
 const BRICK: Color = Color::new(0.78, 0.5, 0.42, 1.0);
 const BORDEAUX: Color = Color::new(0.45, 0.05, 0.16, 1.0);
+const TANK_JOINT_TIP: Vec2 = Vec2::new(3.2, 2.2); // bout du joint, depuis l'arriere du char
+const TANK_GREEN: Color = Color::new(0.37, 0.44, 0.22, 1.0);
+const TANK_DARK: Color = Color::new(0.24, 0.3, 0.14, 1.0);
+const MED_SEA: Color = Color::new(0.1, 0.45, 0.72, 1.0); // la Mediterranee
+const TILE: Color = Color::new(0.82, 0.42, 0.27, 1.0); // tuiles romaines
+const LIMESTONE: Color = Color::new(0.9, 0.88, 0.82, 1.0); // calcaire des calanques
+const LAVENDER: Color = Color::new(0.56, 0.44, 0.78, 1.0);
+const SAND: Color = Color::new(0.93, 0.78, 0.5, 1.0);
 const BONE: Color = Color::new(0.96, 0.93, 0.84, 1.0);
 
 fn blood(shade: f32) -> Color {
@@ -95,6 +123,17 @@ fn hash(i: i32, salt: u32) -> f32 {
     (x >> 8) as f32 / (1u32 << 24) as f32
 }
 
+/// Deltaplane : vitesse verticale donnee par un coup de nez, apres `t`
+/// secondes de vol. Elle s'epuise : la gravite finit toujours par gagner.
+fn glide_lift(t: f32) -> f32 {
+    5.5 * (1.0 - t / GLIDE_MAX).max(0.0)
+}
+
+/// Deltaplane : vitesse de chute maximale, qui augmente au fil du vol.
+fn glide_sink(t: f32) -> f32 {
+    1.4 + 2.6 * (t / GLIDE_MAX).clamp(0.0, 1.0)
+}
+
 fn pick<'a>(list: &[&'a str]) -> &'a str {
     list[gen_range(0, list.len())]
 }
@@ -103,11 +142,24 @@ fn pick<'a>(list: &[&'a str]) -> &'a str {
 // Records
 // ---------------------------------------------------------------------------
 
+#[cfg(not(windows))]
 fn data_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("packarch-acaboulette"))
+}
+
+// Sous Windows : %APPDATA%\packarch-acaboulette
+#[cfg(windows)]
+fn data_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("AppData").join("Roaming"))
+        })?;
     Some(base.join("packarch-acaboulette"))
 }
 
@@ -126,7 +178,7 @@ fn save_record(value: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// Les quartiers de Bordeaux (ils defilent en boucle)
+// Les quartiers : Bordeaux, Marseille, Forcalquier, l'Algerie (en boucle)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
@@ -138,9 +190,66 @@ enum Zone {
     SainteCatherine,
     CiteDuVin,
     Chaban,
+    // Marseille : on y arrive au petit matin, apres la premiere nuit
+    VieuxPort,
+    Canebiere,
+    Panier,
+    BonneMere,
+    Velodrome,
+    Corniche,
+    // Forcalquier, en Haute-Provence
+    Bourguet,
+    Citadelle,
+    Lavande,
+    Oliviers,
+    Mourres,
+    // L'Algerie
+    GrandePoste,
+    Casbah,
+    Maqam,
+    NotreDameAfrique,
+    Sahara,
 }
 
-const ZONES: [Zone; 7] = [
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum City {
+    Bordeaux,
+    Marseille,
+    Forcalquier,
+    Algerie,
+}
+
+/// Les villes de depart, dans l'ordre du voyage.
+const CITIES: [City; 4] = [City::Bordeaux, City::Marseille, City::Forcalquier, City::Algerie];
+
+impl City {
+    fn name(self) -> &'static str {
+        match self {
+            City::Bordeaux => "Bordeaux",
+            City::Marseille => "Marseille",
+            City::Forcalquier => "Forcalquier",
+            City::Algerie => "Algérie",
+        }
+    }
+    /// Rang de son premier quartier dans la boucle.
+    fn first_zone(self) -> usize {
+        ZONES.iter().position(|z| z.city() == self).unwrap_or(0)
+    }
+}
+
+/// Ville de depart choisie sur l'ecran titre : decale toute la boucle des
+/// quartiers (la partie commence toujours a x = 0).
+static START_CITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn start_city() -> usize {
+    START_CITY.load(std::sync::atomic::Ordering::Relaxed).min(CITIES.len() - 1)
+}
+
+fn set_start_city(k: usize) {
+    START_CITY.store(k % CITIES.len(), std::sync::atomic::Ordering::Relaxed);
+}
+
+const ZONES: [Zone; 23] = [
     Zone::Chartrons,
     Zone::Bourse,
     Zone::PontDePierre,
@@ -148,17 +257,66 @@ const ZONES: [Zone; 7] = [
     Zone::SainteCatherine,
     Zone::CiteDuVin,
     Zone::Chaban,
+    Zone::VieuxPort,
+    Zone::Canebiere,
+    Zone::Panier,
+    Zone::BonneMere,
+    Zone::Velodrome,
+    Zone::Corniche,
+    Zone::Bourguet,
+    Zone::Citadelle,
+    Zone::Lavande,
+    Zone::Oliviers,
+    Zone::Mourres,
+    Zone::GrandePoste,
+    Zone::Casbah,
+    Zone::Maqam,
+    Zone::NotreDameAfrique,
+    Zone::Sahara,
 ];
 
 fn zone_index(x: f32) -> i32 {
     (x / ZONE_LEN).floor() as i32
 }
 
+/// Quartier de rang `zi` (rang compte depuis le depart de la partie).
+fn zone_of(zi: i32) -> Zone {
+    let shift = CITIES[start_city()].first_zone() as i32;
+    ZONES[(zi + shift).rem_euclid(ZONES.len() as i32) as usize]
+}
+
 fn zone_at(x: f32) -> Zone {
-    ZONES[zone_index(x).rem_euclid(ZONES.len() as i32) as usize]
+    zone_of(zone_index(x))
 }
 
 impl Zone {
+    fn city(self) -> City {
+        match self {
+            Zone::Chartrons | Zone::Bourse | Zone::PontDePierre | Zone::GrosseCloche | Zone::SainteCatherine | Zone::CiteDuVin | Zone::Chaban => City::Bordeaux,
+            Zone::VieuxPort | Zone::Canebiere | Zone::Panier | Zone::BonneMere | Zone::Velodrome | Zone::Corniche => City::Marseille,
+            Zone::Bourguet | Zone::Citadelle | Zone::Lavande | Zone::Oliviers | Zone::Mourres => City::Forcalquier,
+            Zone::GrandePoste | Zone::Casbah | Zone::Maqam | Zone::NotreDameAfrique | Zone::Sahara => City::Algerie,
+        }
+    }
+    /// Couleur de la bande derriere les quais : fleuve, mer, champ ou sable.
+    fn band(self) -> Color {
+        match self {
+            Zone::Lavande => LAVENDER,
+            Zone::Oliviers => Color::new(0.74, 0.7, 0.46, 1.0), // herbe seche
+            Zone::Mourres => Color::new(0.66, 0.66, 0.42, 1.0), // garrigue
+            Zone::Sahara => SAND,
+            _ => match self.city() {
+                City::Bordeaux => GARONNE,
+                City::Marseille => MED_SEA,
+                City::Forcalquier => LAVENDER,
+                City::Algerie => Color::new(0.1, 0.5, 0.7, 1.0), // la baie d'Alger
+            },
+        }
+    }
+    /// Grand ciel bleu sans nuages (partout sauf a Bordeaux).
+    fn sunny(self) -> f32 {
+        if self.city() == City::Bordeaux { 0.0 } else { 1.0 }
+    }
     fn name(self) -> &'static str {
         match self {
             Zone::Chartrons => "Quai des Chartrons",
@@ -166,24 +324,59 @@ impl Zone {
             Zone::PontDePierre => "Pont de pierre",
             Zone::GrosseCloche => "La Grosse Cloche",
             Zone::SainteCatherine => "Rue Sainte-Catherine",
-            Zone::CiteDuVin => "La Cite du Vin",
+            Zone::CiteDuVin => "La Cité du Vin",
             Zone::Chaban => "Pont Chaban-Delmas",
+            Zone::VieuxPort => "Marseille : le Vieux-Port",
+            Zone::Canebiere => "La Canebière",
+            Zone::Panier => "Le Panier",
+            Zone::BonneMere => "Notre-Dame de la Garde",
+            Zone::Velodrome => "Stade Vélodrome",
+            Zone::Corniche => "La Corniche Kennedy",
+            Zone::Bourguet => "Forcalquier : place du Bourguet",
+            Zone::Citadelle => "La Citadelle",
+            Zone::Lavande => "Les champs de lavande",
+            Zone::Oliviers => "L'oliveraie",
+            Zone::Mourres => "Les Mourres",
+            Zone::GrandePoste => "Alger : la Grande Poste",
+            Zone::Casbah => "La Casbah",
+            Zone::Maqam => "Maqam Echahid",
+            Zone::NotreDameAfrique => "Notre-Dame d'Afrique",
+            Zone::Sahara => "Le Sahara",
         }
     }
     fn subtitle(self) -> &'static str {
         match self {
             Zone::Chartrons => "Les pigeons des Chartrons sont tarpin gras",
-            Zone::Bourse => "Ca glisse sur le Miroir d'eau !",
-            Zone::PontDePierre => "La Garonne, couleur cafe au lait",
+            Zone::Bourse => "Ça glisse sur le Miroir d'eau !",
+            Zone::PontDePierre => "La Garonne, couleur café au lait",
             Zone::GrosseCloche => "La Grosse Cloche sonne pour toi",
             Zone::SainteCatherine => "Il pleut. Normal, c'est Bordeaux.",
-            Zone::CiteDuVin => "Un petit canon de Saint-Emilion ?",
+            Zone::CiteDuVin => "Un petit canon de Saint-Émilion ?",
             Zone::Chaban => "Le tablier monte, les CRS descendent",
+            Zone::VieuxPort => "Ici, « tarpin », ça se dit pour de vrai. Peuchère !",
+            Zone::Canebiere => "Elle descend jusqu'au port, et le matou avec",
+            Zone::Panier => "Ça sent le savon et le linge qui sèche",
+            Zone::BonneMere => "La Bonne Mère veille sur le gros matou",
+            Zone::Velodrome => "Allez l'OM ! Les Girondins ? Connais pas.",
+            Zone::Corniche => "Au large, le château d'If. Tarpin beau.",
+            Zone::Bourguet => "Lundi, jour de marché : ça sent l'olive et le pastis",
+            Zone::Citadelle => "Le carillon sonne, les pigeons s'envolent",
+            Zone::Lavande => "Ça sent tarpin bon. Atchoum !",
+            Zone::Oliviers => "Des oliviers centenaires. Ici, l'huile, c'est sacré.",
+            Zone::Mourres => "Des champignons de pierre. Ça ne se mange pas.",
+            Zone::GrandePoste => "Alger la Blanche, face à la baie",
+            Zone::Casbah => "Des ruelles, des escaliers, et des chats partout",
+            Zone::Maqam => "Le Mémorial du Martyr domine la baie",
+            Zone::NotreDameAfrique => "Elle veille sur Alger, comme la Bonne Mère sur Marseille",
+            Zone::Sahara => "Du sable, du sable... la plus grande litière du monde",
         }
     }
     /// Pas de facades : on voit la Garonne.
     fn river(self) -> bool {
-        matches!(self, Zone::PontDePierre | Zone::CiteDuVin | Zone::Chaban)
+        matches!(
+            self,
+            Zone::PontDePierre | Zone::CiteDuVin | Zone::Chaban | Zone::VieuxPort | Zone::Corniche | Zone::Lavande | Zone::Oliviers | Zone::Mourres | Zone::Maqam | Zone::Sahara
+        )
     }
     /// Demi-largeur du monument (coordonnees du plan lointain).
     fn landmark_half(self) -> f32 {
@@ -195,6 +388,22 @@ impl Zone {
             Zone::SainteCatherine => 13.0,
             Zone::CiteDuVin => 0.0,
             Zone::Chaban => 0.0,
+            Zone::VieuxPort => 0.0,
+            Zone::Canebiere => 7.0,
+            Zone::Panier => 11.0,
+            Zone::BonneMere => 15.0,
+            Zone::Velodrome => 18.0,
+            Zone::Corniche => 0.0,
+            Zone::Bourguet => 9.0,
+            Zone::Citadelle => 14.0,
+            Zone::Lavande => 0.0,
+            Zone::Oliviers => 0.0,
+            Zone::Mourres => 0.0,
+            Zone::GrandePoste => 11.0,
+            Zone::Casbah => 9.0,
+            Zone::Maqam => 0.0,
+            Zone::NotreDameAfrique => 14.0,
+            Zone::Sahara => 0.0,
         }
     }
 }
@@ -311,6 +520,20 @@ fn round_rect(x: f32, y: f32, w: f32, h: f32, r: f32, c: Color) {
     }
 }
 
+/// Boutons de choix de la ville sur l'ecran titre : (x, y, largeur, hauteur).
+fn city_buttons() -> [(f32, f32, f32, f32); 4] {
+    let w = screen_width();
+    let gap = 14.0;
+    let bw = 178.0f32.min((w - 32.0 - 3.0 * gap) / 4.0);
+    let x0 = w / 2.0 - (4.0 * bw + 3.0 * gap) / 2.0;
+    let y = 414.0f32.min(screen_height() * 0.62);
+    std::array::from_fn(|k| (x0 + k as f32 * (bw + gap), y, bw, 46.0))
+}
+
+fn city_button_at((mx, my): (f32, f32)) -> Option<usize> {
+    city_buttons().iter().position(|&(x, y, w, h)| mx >= x && mx <= x + w && my >= y && my <= y + h)
+}
+
 /// Texte facon BD : contour fonce epais, centre sur (x, y).
 fn comic_text(txt: &str, x: f32, y: f32, size: u16, fill: Color, outline: Color) {
     let dim = measure_text(txt, None, size, 1.0);
@@ -369,6 +592,7 @@ enum Kind {
     Rat,
     Dog,
     Crs,
+    Gull, // mouette, en altitude : seulement en deltaplane
 }
 
 impl Kind {
@@ -378,6 +602,7 @@ impl Kind {
             Kind::Rat => 0.2,
             Kind::Dog => 0.3,
             Kind::Crs => 0.45,
+            Kind::Gull => 0.3,
         }
     }
     fn points(self) -> f32 {
@@ -386,6 +611,7 @@ impl Kind {
             Kind::Rat => 20.0,
             Kind::Dog => 35.0,
             Kind::Crs => 150.0,
+            Kind::Gull => 80.0,
         }
     }
     /// Ce que ca fait grossir quand il l'avale.
@@ -395,6 +621,7 @@ impl Kind {
             Kind::Rat => 0.11,
             Kind::Dog => 0.22,
             Kind::Crs => 0.0, // on ne mange pas les CRS, on les fait valdinguer
+            Kind::Gull => 0.25,
         }
     }
     fn color(self) -> Color {
@@ -403,6 +630,7 @@ impl Kind {
             Kind::Rat => Color::new(0.45, 0.38, 0.33, 1.0),
             Kind::Dog => Color::new(0.72, 0.5, 0.3, 1.0),
             Kind::Crs => Color::new(0.12, 0.16, 0.3, 1.0),
+            Kind::Gull => Color::new(0.95, 0.95, 0.97, 1.0),
         }
     }
 }
@@ -489,6 +717,24 @@ impl Vehicle {
             VehKind::Moto => 1.35,
         }
     }
+}
+
+/// Char d'assaut a l'arret, qui attend qu'on saute dedans.
+struct TankSpot {
+    x: f32, // arriere du char
+}
+
+/// L'enorme obus du char : il file tout droit.
+struct Shell {
+    pos: Vec2,
+}
+
+/// Missile a tete chercheuse.
+struct Missile {
+    pos: Vec2,
+    vel: Vec2,
+    aim: Option<Vec2>,
+    age: f32,
 }
 
 struct Tram {
@@ -605,6 +851,18 @@ struct Game {
     speed: f32,
     on_ground: bool,
     jumps_left: u32,
+    tank: f32, // temps restant dans le char d'assaut (0 = a pattes)
+    tank_recoil: f32,
+    shell_cd: f32,
+    missile_cd: f32,
+    next_tank_x: f32,
+    tank_spots: Vec<TankSpot>,
+    shells: Vec<Shell>,
+    missiles: Vec<Missile>,
+    glide_left: bool, // le deltaplane (3e saut) est encore disponible
+    gliding: bool,
+    glide_t: f32,   // vol consomme (les coups de nez en coutent)
+    glide_age: f32, // temps depuis l'ouverture de l'aile
     holding: bool,
     slamming: bool,
     fat: f32,
@@ -631,7 +889,8 @@ struct Game {
     score: f32,
     combo: u32,
     combo_t: f32,
-    kills: [u32; 4],
+    kills: [u32; 5],
+    gull_hint: bool, // les mouettes n'ont pas encore ete annoncees
     gave_count: u32,
     hazards: Vec<Hazard>,
 
@@ -669,6 +928,18 @@ impl Game {
             speed: START_SPEED,
             on_ground: true,
             jumps_left: 1,
+            tank: 0.0,
+            tank_recoil: 0.0,
+            shell_cd: 0.0,
+            missile_cd: 0.0,
+            next_tank_x: TANK_MIN_X,
+            tank_spots: Vec::new(),
+            shells: Vec::new(),
+            missiles: Vec::new(),
+            glide_left: true,
+            gliding: false,
+            glide_t: 0.0,
+            glide_age: 0.0,
             holding: false,
             slamming: false,
             fat: 0.0,
@@ -693,7 +964,8 @@ impl Game {
             score: 0.0,
             combo: 0,
             combo_t: 0.0,
-            kills: [0; 4],
+            kills: [0; 5],
+            gull_hint: true,
             gave_count: 0,
             hazards: Vec::new(),
             critters: Vec::new(),
@@ -733,9 +1005,45 @@ impl Game {
         g
     }
 
-    /// Indestructible : mode gave (trop gros) ou kebab turbo.
+    /// Indestructible : mode gave (trop gros), kebab turbo ou char d'assaut.
     fn mighty(&self) -> bool {
-        self.gave > 0.0 || self.kebab > 0.0
+        self.gave > 0.0 || self.kebab > 0.0 || self.tank > 0.0
+    }
+
+    fn city(&self) -> City {
+        zone_at(self.pos.x).city()
+    }
+
+    /// Le tram du coin.
+    fn tram_name(&self) -> &'static str {
+        match self.city() {
+            City::Bordeaux => "tram B",
+            City::Marseille => "petit train",
+            City::Forcalquier => "tracteur",
+            City::Algerie => "tram d'Alger",
+        }
+    }
+
+    /// Quartier precedent, quartier courant et avancement du fondu entre les
+    /// deux (couleur de l'eau, du ciel) sur les premiers metres du quartier.
+    fn zone_fade(&self) -> (Zone, Zone, f32) {
+        let x = self.pos.x;
+        let cur = zone_at(x);
+        if x < ZONE_LEN {
+            return (cur, cur, 1.0); // premier quartier de la partie
+        }
+        let into = x - zone_index(x) as f32 * ZONE_LEN;
+        (zone_at(x - ZONE_LEN), cur, (into / 45.0).min(1.0))
+    }
+
+    fn band_col(&self) -> Color {
+        let (a, b, t) = self.zone_fade();
+        mix(a.band(), b.band(), t)
+    }
+
+    fn sunny(&self) -> f32 {
+        let (a, b, t) = self.zone_fade();
+        a.sunny() + (b.sunny() - a.sunny()) * t
     }
 
     fn total(&self) -> u32 {
@@ -748,6 +1056,9 @@ impl Game {
 
     /// Centre et rayon du cercle de collision de Acaboulette.
     fn hit_circle(&self) -> (Vec2, f32) {
+        if self.tank > 0.0 {
+            return (self.pos + vec2(0.7, 1.1), 1.5);
+        }
         let r = self.body_r();
         (self.pos + vec2(0.1, 0.2 + r * 0.85), r * 0.9)
     }
@@ -823,10 +1134,33 @@ impl Game {
 
         match self.phase {
             Phase::Title => {
-                if jump_pressed {
+                // choix de la ville de depart : fleches, chiffres ou clic sur un bouton
+                let n = CITIES.len();
+                let mut sel = start_city();
+                if is_key_pressed(KeyCode::Left) {
+                    sel = (sel + n - 1) % n;
+                }
+                if is_key_pressed(KeyCode::Right) {
+                    sel = (sel + 1) % n;
+                }
+                for (k, key) in [KeyCode::Key1, KeyCode::Key2, KeyCode::Key3, KeyCode::Key4].into_iter().enumerate() {
+                    if is_key_pressed(key) {
+                        sel = k;
+                    }
+                }
+                let mut start = is_key_pressed(KeyCode::Space) || is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter);
+                if is_mouse_button_pressed(MouseButton::Left)
+                    && let Some(k) = city_button_at(mouse_position())
+                {
+                    sel = k;
+                    start = true;
+                }
+                set_start_city(sel);
+                if start {
                     self.phase = Phase::Running;
                     self.time = 0.0;
-                    self.say(Zone::Chartrons.name(), Zone::Chartrons.subtitle());
+                    let z = zone_at(0.0);
+                    self.say(z.name(), z.subtitle());
                 }
             }
             Phase::Over => {
@@ -835,7 +1169,11 @@ impl Game {
                     *self = Game::new(best, self.gore);
                     self.phase = Phase::Running;
                     self.critters.clear();
-                    self.say(Zone::Chartrons.name(), "C'est reparti, gros matou !");
+                    self.say(zone_at(0.0).name(), "C'est reparti, gros matou !");
+                } else if is_key_pressed(KeyCode::V) && self.over_t > 0.6 {
+                    // retour a l'ecran titre pour choisir une autre ville
+                    let best = self.best;
+                    *self = Game::new(best, self.gore);
                 }
             }
             Phase::Running if self.closeup > 0.0 => {
@@ -843,6 +1181,15 @@ impl Game {
                 if jump_pressed && self.closeup_can_skip() {
                     self.closeup = 0.0;
                     self.end_closeup();
+                }
+            }
+            Phase::Running if self.tank > 0.0 => {
+                // dans le char : clic gauche = obus, clic droit = missiles
+                if jump_pressed {
+                    self.fire_shell();
+                }
+                if slam_pressed {
+                    self.fire_missiles();
                 }
             }
             Phase::Running => {
@@ -858,9 +1205,24 @@ impl Game {
                         self.jumps_left -= 1;
                         self.vy = jv * 0.85;
                         self.slamming = false;
+                    } else if self.gliding {
+                        // coup de nez : ca remonte un peu, de moins en moins
+                        self.vy = self.vy.max(glide_lift(self.glide_t));
+                        self.glide_t += GLIDE_FLARE_COST;
+                    } else if self.glide_left {
+                        // triple saut : il sort le deltaplane
+                        self.glide_left = false;
+                        self.gliding = true;
+                        self.glide_t = 0.0;
+                        self.glide_age = 0.0;
+                        self.slamming = false;
+                        self.vy = self.vy.max(2.0);
+                        let (cc, _) = self.hit_circle();
+                        self.pop(cc + vec2(0.0, 1.6), "FLAP !", Color::new(0.6, 0.9, 1.0, 1.0));
                     }
                 }
                 if slam_pressed && !self.on_ground && !self.slamming {
+                    self.gliding = false;
                     self.slamming = true;
                     self.vy = SLAM_V;
                 }
@@ -911,9 +1273,32 @@ impl Game {
         if had_gave && self.gave == 0.0 {
             self.fat = 0.5;
             self.invuln = self.invuln.max(1.0);
-            self.say("Fin du mode gave", "Tout est reste dans la litiere : Acaboulette est re-mince");
+            self.say("Fin du mode gavé", "Tout est resté dans la litière : Acaboulette est re-mince");
         }
-        if self.fat >= MAX_FAT && self.gave == 0.0 {
+        if self.tank > 0.0 {
+            self.tank -= dt;
+            self.shell_cd = (self.shell_cd - dt).max(0.0);
+            self.missile_cd = (self.missile_cd - dt).max(0.0);
+            self.tank_recoil = (self.tank_recoil - dt * 5.0).max(0.0);
+            if self.tank <= 0.0 {
+                self.leave_tank();
+            } else if gen_range(0.0, 1.0) < 0.12 {
+                // la fumee du joint
+                let tip = self.pos + vec2(-TANK_SEAT, 0.0) + TANK_JOINT_TIP;
+                self.particles.push(Particle {
+                    kind: PK::Dust,
+                    pos: tip,
+                    vel: vec2(gen_range(-1.5, 0.2), gen_range(1.2, 2.4)),
+                    ang: 0.0,
+                    spin: 0.0,
+                    size: gen_range(0.05, 0.1),
+                    col: Color::new(0.92, 0.95, 0.9, 0.6),
+                    life: gen_range(0.6, 1.1),
+                    max_life: 1.1,
+                });
+            }
+        }
+        if self.fat >= MAX_FAT && self.gave == 0.0 && self.tank == 0.0 {
             // Trop gros : pause litiere, puis mode gave
             self.closeup = LITTER_TIME;
             self.closeup_len = LITTER_TIME;
@@ -924,7 +1309,7 @@ impl Game {
         let had_kebab = self.kebab > 0.0;
         self.kebab = (self.kebab - dt).max(0.0);
         if had_kebab && self.kebab == 0.0 {
-            self.say("Fin du kebab", "Retour a la vitesse normale. Tarpin dommage.");
+            self.say("Fin du kebab", "Retour à la vitesse normale. Tarpin dommage.");
             self.invuln = self.invuln.max(1.0);
         }
         self.combo_t -= dt;
@@ -939,7 +1324,13 @@ impl Game {
         }
 
         self.speed = (self.speed + SPEED_GAIN * dt).min(MAX_SPEED);
-        let spd = self.speed * (1.0 - 0.45 * (self.hurt_t / 0.6)) * if self.kebab > 0.0 {
+        let spd = if self.tank > 0.0 {
+            TANK_SPEED
+        } else {
+            self.speed * (1.0 - 0.45 * (self.hurt_t / 0.6))
+        } * if self.tank > 0.0 {
+            1.0
+        } else if self.kebab > 0.0 {
             KEBAB_SPEED
         } else if self.gave > 0.0 {
             1.25
@@ -953,13 +1344,30 @@ impl Game {
             self.run_phase += dt * 3.0;
         }
 
+        if self.tank > 0.0 {
+            // le char reste au sol
+            self.pos.y = 0.0;
+            self.vy = 0.0;
+            self.on_ground = true;
+            self.on_tram = false;
+        }
+
         // Saut / gravite / atterrissage
         let prev_y = self.pos.y;
         let r = self.body_r();
         let foot = r * 0.75;
         if !self.on_ground {
-            let g = if self.holding && self.vy > 0.0 && !self.slamming { GRAV * HOLD_FACTOR } else { GRAV };
-            self.vy -= g * dt;
+            if self.gliding {
+                self.glide_t += dt;
+                self.glide_age += dt;
+                self.vy = (self.vy - GLIDE_GRAV * dt).max(-glide_sink(self.glide_t));
+                if self.glide_t >= GLIDE_MAX {
+                    self.gliding = false; // l'aile se replie : il retombe
+                }
+            } else {
+                let g = if self.holding && self.vy > 0.0 && !self.slamming { GRAV * HOLD_FACTOR } else { GRAV };
+                self.vy -= g * dt;
+            }
             self.pos.y += self.vy * dt;
             if self.vy <= 0.0 {
                 let mut top = 0.0f32;
@@ -1073,6 +1481,8 @@ impl Game {
         }
         self.collide_critters();
         self.collide_pickups();
+        self.enter_tank();
+        self.update_projectiles(dt);
 
         // Nouveau quartier
         let zi = zone_index(self.pos.x);
@@ -1094,6 +1504,7 @@ impl Game {
         self.trams.retain(|t| t.x + TRAM_LEN > back - 10.0);
         self.vehicles.retain(|v| v.x + v.w() > back - 10.0);
         self.hazards.retain(|h| h.x > back);
+        self.tank_spots.retain(|t| t.x + TANK_LEN > back);
         self.pickups.retain(|p| !p.taken && p.pos.x > back);
         self.decals.retain(|d| d.x > back);
     }
@@ -1101,11 +1512,18 @@ impl Game {
     fn land(&mut self, tram: bool) {
         self.on_ground = true;
         self.jumps_left = 1;
+        self.glide_left = true;
+        self.gliding = false;
         self.squash = if self.slamming { 1.0 } else { 0.5 };
         self.on_tram = tram;
         if tram && self.first_aps {
             self.first_aps = false;
-            self.say("Sur le toit du tram B !", "Pas de catenaire en centre-ville : c'est l'APS, peuchere");
+            match self.city() {
+                City::Bordeaux => self.say("Sur le toit du tram B !", "Pas de caténaire en centre-ville : c'est l'APS, peuchère"),
+                City::Marseille => self.say("Sur le toit du petit train !", "Visite guidée du Vieux-Port, et sans payer le ticket"),
+                City::Forcalquier => self.say("Sur les bottes de foin !", "Ça gratte, mais on voit la montagne de Lure"),
+                City::Algerie => self.say("Sur le toit du tram d'Alger !", "Vue sur la baie, et sans payer le ticket"),
+            }
         }
         if self.slamming {
             self.slamming = false;
@@ -1169,7 +1587,14 @@ impl Game {
             }
         }
         if warn && self.phase == Phase::Running {
-            self.say("DING DING ! Tram B !", "Saute sur le toit, ou finis en crepe");
+            let title = match self.city() {
+                City::Bordeaux => "DING DING ! Tram B !",
+                City::Marseille => "TCHOU TCHOU ! Le petit train des touristes !",
+                City::Forcalquier => "POUET ! Un tracteur et son foin !",
+                City::Algerie => "DING DING ! Tram d'Alger !",
+            };
+            let sub = if self.city() == City::Forcalquier { "Saute sur les bottes de foin, ou finis en crêpe" } else { "Saute sur le toit, ou finis en crêpe" };
+            self.say(title, sub);
         }
         // Le tram ecrase ce qui traine sur les rails
         let mut victims = Vec::new();
@@ -1186,7 +1611,8 @@ impl Game {
             }
             if self.first_tram_kill && self.phase == Phase::Running {
                 self.first_tram_kill = false;
-                self.say_tarpin("Le tram B fait le menage", "Tarpin efficace, pour une fois qu'il est a l'heure");
+                let title = format!("Le {} fait le ménage", self.tram_name());
+                self.say_tarpin(&title, "Tarpin efficace, pour une fois qu'il est à l'heure");
             }
         }
     }
@@ -1240,33 +1666,17 @@ impl Game {
                 continue;
             }
             let kind = v.kind;
-            let mid = vec2(v.x + w / 2.0, h / 2.0);
-            let col = v.color;
             self.vehicles[k].hit = true;
             if self.mighty() {
-                // mode gave / kebab : le vehicule part en morceaux
-                self.vehicles[k].x = -1.0e6;
-                for i in 0..22 {
-                    self.particles.push(Particle {
-                        kind: PK::Debris,
-                        pos: mid + vec2(gen_range(-w / 2.0, w / 2.0), gen_range(-0.4, 0.4)),
-                        vel: vec2(gen_range(2.0, 10.0), gen_range(3.0, 10.0)),
-                        ang: gen_range(0.0, TAU),
-                        spin: gen_range(-12.0, 12.0),
-                        size: gen_range(0.1, 0.28),
-                        col: if i % 3 == 0 { INK } else { col },
-                        life: 4.0,
-                        max_life: 4.0,
-                    });
+                // mode gave / kebab / char : le vehicule part en morceaux
+                self.wreck_vehicle(k);
+                if self.tank == 0.0 {
+                    self.say_tarpin("Carrosserie en kit", "Mode gavé : même les voitures y passent. Tarpin !");
                 }
-                self.score += 150.0;
-                self.shake(0.4);
-                self.pop(mid + vec2(0.0, 1.2), "KABOUM ! +150", Color::new(1.0, 0.8, 0.1, 1.0));
-                self.say_tarpin("Carrosserie en kit", "Mode gave : meme les voitures y passent. Tarpin !");
             } else {
                 let line = match kind {
-                    VehKind::Car => pick(&["Renverse par une voiture !", "Un SUV sur les quais : tarpin mal", "Bouchon sur la rocade, et toi dessous"]),
-                    VehKind::Moto => pick(&["Fauche par une moto !", "Un livreur a scooter, classique", "La moto ne s'est pas arretee"]),
+                    VehKind::Car => pick(&["Renversé par une voiture !", "Un SUV sur les quais : tarpin mal", "Bouchon sur la rocade, et toi dessous"]),
+                    VehKind::Moto => pick(&["Fauché par une moto !", "Un livreur à scooter, classique", "La moto ne s'est pas arrêtée"]),
                 };
                 self.hurt(line);
                 if self.phase != Phase::Running {
@@ -1274,6 +1684,341 @@ impl Game {
                 }
             }
         }
+    }
+
+    /// Le vehicule part en morceaux.
+    fn wreck_vehicle(&mut self, k: usize) {
+        let v = &mut self.vehicles[k];
+        let (w, h, col) = (v.w(), v.h(), v.color);
+        let mid = vec2(v.x + w / 2.0, h / 2.0);
+        v.hit = true;
+        v.x = -1.0e6;
+        for i in 0..22 {
+            self.particles.push(Particle {
+                kind: PK::Debris,
+                pos: mid + vec2(gen_range(-w / 2.0, w / 2.0), gen_range(-0.4, 0.4)),
+                vel: vec2(gen_range(2.0, 10.0), gen_range(3.0, 10.0)),
+                ang: gen_range(0.0, TAU),
+                spin: gen_range(-12.0, 12.0),
+                size: gen_range(0.1, 0.28),
+                col: if i % 3 == 0 { INK } else { col },
+                life: 4.0,
+                max_life: 4.0,
+            });
+        }
+        self.score += 150.0;
+        self.shake(0.4);
+        self.pop(mid + vec2(0.0, 1.2), "KABOUM ! +150", Color::new(1.0, 0.8, 0.1, 1.0));
+    }
+
+    /// Le tram B pulverise (par le char ou son obus).
+    fn wreck_tram(&mut self, k: usize) {
+        let x = self.trams[k].x;
+        self.trams[k].x = -1.0e6;
+        for i in 0..90 {
+            let col = match i % 4 {
+                0 => INK,
+                1 => Color::new(0.85, 0.87, 0.9, 1.0),
+                2 => Color::new(0.2, 0.35, 0.6, 1.0),
+                _ => Color::new(0.55, 0.6, 0.66, 1.0),
+            };
+            self.particles.push(Particle {
+                kind: PK::Debris,
+                pos: vec2(x + gen_range(0.0, TRAM_LEN), gen_range(0.3, TRAM_TOP)),
+                vel: vec2(gen_range(-2.0, 14.0), gen_range(3.0, 13.0)),
+                ang: gen_range(0.0, TAU),
+                spin: gen_range(-14.0, 14.0),
+                size: gen_range(0.12, 0.4),
+                col,
+                life: 4.0,
+                max_life: 4.0,
+            });
+        }
+        for i in 0..4 {
+            self.explosion(vec2(x + 1.0 + i as f32 * 4.5, 1.4));
+        }
+        self.score += 500.0;
+        self.shake(0.9);
+        let at = vec2(x.max(self.pos.x + 2.0).min(self.pos.x + 9.0), TRAM_TOP + 1.2);
+        self.pop(at, "PULVÉRISÉ ! +500", Color::new(1.0, 0.8, 0.1, 1.0));
+        let title = format!("Le {} pulvérisé !", self.tram_name());
+        self.say(&title, "Trafic interrompu sur la ligne. Tarpin longtemps.");
+    }
+
+    // -----------------------------------------------------------------------
+    // Le char d'assaut
+    // -----------------------------------------------------------------------
+
+    /// Il faut sauter dans le char a l'arret pour le prendre.
+    fn enter_tank(&mut self) {
+        if self.tank > 0.0 || self.on_ground {
+            return;
+        }
+        // en l'air au-dessus du char (meme d'assez haut) : il tombe dedans
+        let (cc, cr) = self.hit_circle();
+        let Some(k) = self.tank_spots.iter().position(|t| {
+            let near = vec2(cc.x.clamp(t.x, t.x + TANK_LEN), cc.y.clamp(0.0, TANK_H + 3.5));
+            near.distance(cc) < cr
+        }) else {
+            return;
+        };
+        let spot = self.tank_spots.remove(k);
+        self.tank = TANK_TIME;
+        self.shell_cd = 0.0;
+        self.missile_cd = 0.0;
+        self.tank_recoil = 0.0;
+        self.pos = vec2(spot.x + TANK_SEAT, 0.0);
+        self.vy = 0.0;
+        self.on_ground = true;
+        self.on_tram = false;
+        self.gliding = false;
+        self.slamming = false;
+        self.jumps_left = 1;
+        self.glide_left = true;
+        self.shake(0.3);
+        self.dust(self.pos, 14);
+        self.pop(self.pos + vec2(0.5, 3.2), "VROUM !", Color::new(0.6, 1.0, 0.4, 1.0));
+        self.say("CHAR D'ASSAUT !", "Clic gauche : OBUS  -  Clic droit : MISSILES");
+    }
+
+    /// Plus de carburant : le char saute, Acaboulette est ejecte.
+    fn leave_tank(&mut self) {
+        self.tank = 0.0;
+        let at = self.pos + vec2(0.5, 1.0);
+        self.explosion(at);
+        for i in 0..26 {
+            self.particles.push(Particle {
+                kind: PK::Debris,
+                pos: at + vec2(gen_range(-1.8, 2.2), gen_range(-0.6, 0.8)),
+                vel: vec2(gen_range(-3.0, 9.0), gen_range(3.0, 11.0)),
+                ang: gen_range(0.0, TAU),
+                spin: gen_range(-12.0, 12.0),
+                size: gen_range(0.12, 0.35),
+                col: if i % 3 == 0 { INK } else { TANK_GREEN },
+                life: 4.0,
+                max_life: 4.0,
+            });
+        }
+        self.vy = JUMP_V;
+        self.on_ground = false;
+        self.jumps_left = 1;
+        self.glide_left = true;
+        self.invuln = self.invuln.max(2.0);
+        self.say("Le char est à sec !", "Plus une goutte de gazole : retour aux pattes");
+    }
+
+    /// Bout du canon.
+    fn muzzle(&self) -> Vec2 {
+        vec2(self.pos.x - TANK_SEAT + 5.7, 1.72)
+    }
+
+    fn fire_shell(&mut self) {
+        if self.shell_cd > 0.0 {
+            return;
+        }
+        self.shell_cd = SHELL_CD;
+        self.tank_recoil = 1.0;
+        let m = self.muzzle();
+        self.shells.push(Shell { pos: m });
+        self.shake(0.3);
+        self.pop(m + vec2(0.5, 1.0), "BLAM !", Color::new(1.0, 0.8, 0.1, 1.0));
+        for i in 0..12 {
+            self.particles.push(Particle {
+                kind: PK::Dust,
+                pos: m,
+                vel: vec2(gen_range(4.0, 14.0), gen_range(-2.5, 2.5)),
+                ang: 0.0,
+                spin: 0.0,
+                size: gen_range(0.15, 0.4),
+                col: if i % 2 == 0 { Color::new(1.0, 0.85, 0.2, 0.9) } else { Color::new(1.0, 0.45, 0.05, 0.9) },
+                life: gen_range(0.2, 0.45),
+                max_life: 0.45,
+            });
+        }
+    }
+
+    fn fire_missiles(&mut self) {
+        if self.missile_cd > 0.0 {
+            return;
+        }
+        self.missile_cd = MISSILE_CD;
+        let targets = self.targets();
+        let rack = vec2(self.pos.x - TANK_SEAT + 1.5, 2.4);
+        for i in 0..MISSILE_N {
+            let aim = if targets.is_empty() { None } else { Some(targets[i % targets.len()]) };
+            let k = i as f32;
+            self.missiles.push(Missile {
+                pos: rack + vec2(k * 0.08, k * 0.05),
+                vel: vec2(TANK_SPEED + 1.0 + k * 1.6, 7.0 + k * 1.7),
+                aim,
+                age: 0.0,
+            });
+        }
+        self.pop(rack + vec2(0.0, 1.4), "FCHHHT !", Color::new(1.0, 1.0, 1.0, 1.0));
+    }
+
+    /// Tout ce qu'un missile peut viser devant le char : obstacles, vehicules,
+    /// mines et bestioles (du plus proche au plus lointain).
+    fn targets(&self) -> Vec<Vec2> {
+        let (x0, x1) = (self.pos.x + 1.0, self.pos.x + 19.0);
+        let mut out = Vec::new();
+        for o in &self.obstacles {
+            if !o.smashed && o.knocked == 0.0 {
+                out.push(vec2(o.x + o.w / 2.0, o.h / 2.0));
+            }
+        }
+        for v in &self.vehicles {
+            if !v.hit {
+                out.push(vec2(v.x + v.w() / 2.0, v.h() / 2.0));
+            }
+        }
+        for h in &self.hazards {
+            if !h.fired {
+                out.push(vec2(h.x, 0.15));
+            }
+        }
+        for c in &self.critters {
+            if !c.dead {
+                out.push(c.center());
+            }
+        }
+        out.retain(|t| t.x > x0 && t.x < x1);
+        out.sort_by(|a, b| a.x.total_cmp(&b.x));
+        out
+    }
+
+    /// Detruit tout ce qui se trouve dans la boite. Renvoie vrai si un tram
+    /// a ete pulverise (seulement si `trams`).
+    fn blast(&mut self, x0: f32, x1: f32, y0: f32, y1: f32, trams: bool) -> bool {
+        for k in 0..self.obstacles.len() {
+            let o = &self.obstacles[k];
+            if !o.smashed && o.knocked == 0.0 && o.x < x1 && o.x + o.w > x0 && y0 < o.h {
+                self.smash_obstacle(k);
+            }
+        }
+        for k in 0..self.vehicles.len() {
+            let v = &self.vehicles[k];
+            if !v.hit && v.x < x1 && v.x + v.w() > x0 && y0 < v.h() {
+                self.wreck_vehicle(k);
+            }
+        }
+        for k in 0..self.hazards.len() {
+            let h = &self.hazards[k];
+            if !h.fired && h.x > x0 - 0.3 && h.x < x1 + 0.3 && y0 < 0.4 {
+                let at = vec2(h.x, 0.1);
+                self.hazards[k].fired = true;
+                self.explosion(at);
+                self.score += 100.0;
+            }
+        }
+        let victims: Vec<usize> = self
+            .critters
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                let (p, r) = (c.center(), c.kind.radius());
+                !c.dead && p.x > x0 - r && p.x < x1 + r && p.y > y0 - r && p.y < y1 + r
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for i in victims {
+            self.kill(i, true);
+        }
+        let mut tram_hit = false;
+        if trams {
+            for k in 0..self.trams.len() {
+                let tx = self.trams[k].x;
+                if tx < x1 && tx + TRAM_LEN > x0 && y0 < TRAM_TOP {
+                    self.wreck_tram(k);
+                    tram_hit = true;
+                }
+            }
+        }
+        tram_hit
+    }
+
+    /// Petite explosion d'un missile.
+    fn small_boom(&mut self, at: Vec2) {
+        self.shake(0.12);
+        for i in 0..14 {
+            let a = gen_range(0.0, TAU);
+            self.particles.push(Particle {
+                kind: PK::Dust,
+                pos: at,
+                vel: Vec2::from_angle(a) * gen_range(1.0, 6.0),
+                ang: 0.0,
+                spin: 0.0,
+                size: gen_range(0.15, 0.35),
+                col: match i % 3 {
+                    0 => Color::new(1.0, 0.85, 0.2, 0.9),
+                    1 => Color::new(1.0, 0.45, 0.05, 0.9),
+                    _ => Color::new(0.3, 0.3, 0.3, 0.7),
+                },
+                life: gen_range(0.3, 0.6),
+                max_life: 0.6,
+            });
+        }
+    }
+
+    fn smoke(&mut self, at: Vec2, size: f32) {
+        self.particles.push(Particle {
+            kind: PK::Dust,
+            pos: at,
+            vel: vec2(gen_range(-0.5, 0.5), gen_range(-0.3, 0.6)),
+            ang: 0.0,
+            spin: 0.0,
+            size,
+            col: Color::new(0.85, 0.85, 0.85, 0.55),
+            life: 0.45,
+            max_life: 0.45,
+        });
+    }
+
+    fn update_projectiles(&mut self, dt: f32) {
+        // Obus : tout droit, il traverse tout (sauf le tram, qu'il pulverise)
+        let mut shells = std::mem::take(&mut self.shells);
+        let limit = self.pos.x + 24.0;
+        shells.retain_mut(|sh| {
+            let prev = sh.pos.x;
+            sh.pos.x += SHELL_SPEED * dt;
+            if gen_range(0.0, 1.0) < 0.5 {
+                self.smoke(sh.pos - vec2(0.7, 0.0), 0.16);
+            }
+            let tram_hit = self.blast(prev - 0.4, sh.pos.x + 0.6, 0.0, sh.pos.y + 1.4, true);
+            !tram_hit && sh.pos.x < limit
+        });
+        self.shells = shells;
+
+        // Missiles a tete chercheuse
+        let mut missiles = std::mem::take(&mut self.missiles);
+        missiles.retain_mut(|m| {
+            m.age += dt;
+            // la tete chercheuse suit sa cible, ou en cherche une autre
+            let targets = self.targets();
+            let near = |p: Vec2| targets.iter().copied().min_by(|a, b| a.distance(p).total_cmp(&b.distance(p)));
+            m.aim = match m.aim.and_then(near) {
+                Some(t) if t.distance(m.aim.unwrap_or(t)) < 3.5 => Some(t),
+                _ => near(m.pos),
+            };
+            let speed = (14.0 + m.age * 34.0).min(36.0);
+            let dir = match m.aim {
+                Some(a) => (a - m.pos).normalize_or_zero(),
+                None => vec2(1.0, -0.12).normalize(),
+            };
+            m.vel = m.vel.lerp(dir * speed, (dt * (3.0 + m.age * 14.0)).min(1.0));
+            m.pos += m.vel * dt;
+            if gen_range(0.0, 1.0) < 0.4 {
+                self.smoke(m.pos - m.vel.normalize_or_zero() * 0.4, 0.1);
+            }
+            let reached = m.aim.is_some_and(|a| a.distance(m.pos) < 0.7);
+            if reached || m.pos.y < 0.12 || m.age > 2.2 {
+                self.small_boom(m.pos);
+                self.blast(m.pos.x - 1.0, m.pos.x + 1.0, m.pos.y - 1.0, m.pos.y + 1.0, false);
+                return false;
+            }
+            true
+        });
+        self.missiles = missiles;
     }
 
     fn collide_hazards(&mut self, dt: f32) {
@@ -1296,12 +2041,15 @@ impl Game {
             match kind {
                 HazKind::Mine => {
                     self.explosion(at);
-                    if self.mighty() || self.invuln > 0.0 {
+                    if self.tank > 0.0 {
+                        self.score += 100.0;
+                        self.pop(at + vec2(0.0, 2.6), "Même pas une rayure ! +100", Color::new(1.0, 0.85, 0.2, 1.0));
+                    } else if self.mighty() || self.invuln > 0.0 {
                         self.vy = JUMP_V * 1.3;
                         self.on_ground = false;
                         self.on_tram = false;
                         self.score += 100.0;
-                        self.pop(at + vec2(0.0, 2.2), "Meme pas mal ! +100", Color::new(1.0, 0.85, 0.2, 1.0));
+                        self.pop(at + vec2(0.0, 2.2), "Même pas mal ! +100", Color::new(1.0, 0.85, 0.2, 1.0));
                     } else {
                         self.die(Death::Mine);
                         return;
@@ -1418,6 +2166,7 @@ impl Game {
         let cat_x = self.pos.x;
         let mut woof = Vec::new();
         let mut crs_shout = false;
+        let mut gull_seen = false;
         for c in &mut self.critters {
             if c.dead {
                 continue;
@@ -1449,6 +2198,14 @@ impl Game {
                 Kind::Rat => {
                     c.pos.x += c.vel.x * dt;
                 }
+                Kind::Gull => {
+                    c.pos.x += c.vel.x * dt;
+                    c.pos.y = c.base_y + (c.phase * 1.6).sin() * 0.3;
+                    if active && !c.flag && c.pos.x - cat_x < 16.0 && c.pos.x > cat_x {
+                        c.flag = true;
+                        gull_seen = true;
+                    }
+                }
                 Kind::Dog => {
                     c.pos.x += c.vel.x * dt;
                     if active && !c.flag && c.pos.x - cat_x < 6.0 && c.pos.x > cat_x {
@@ -1457,6 +2214,15 @@ impl Game {
                     }
                 }
             }
+        }
+        if gull_seen && self.gull_hint {
+            self.gull_hint = false;
+            let title = match self.city() {
+                City::Marseille => "Des gabians là-haut !",
+                City::Forcalquier => "Des mouettes à Forcalquier ?!",
+                _ => "Des mouettes là-haut !",
+            };
+            self.say(title, "Trop haut pour un saut : sors le deltaplane");
         }
         for at in woof {
             self.pop(at, pick(&["WAF !", "WOUAF !", "GRRR !", "KAI KAI !"]), WHITE);
@@ -1489,8 +2255,13 @@ impl Game {
                     let kind = o.kind;
                     self.obstacles[k].knocked = 0.01;
                     let line = match kind {
-                        ObsKind::Barrier => pick(&["Encore des travaux a Bordeaux...", "Travaux. Comme d'hab."]),
-                        ObsKind::Bike => "Un velo couche en travers, classique",
+                        ObsKind::Barrier => match self.city() {
+                            City::Bordeaux => pick(&["Encore des travaux à Bordeaux...", "Travaux. Comme d'hab."]),
+                            City::Marseille => pick(&["Encore des travaux à Marseille...", "Travaux. Depuis 2600 ans."]),
+                            City::Forcalquier => pick(&["Des travaux, même à Forcalquier", "Travaux. Reprise après la sieste."]),
+                            City::Algerie => pick(&["Encore des travaux à Alger...", "Travaux. Comme partout."]),
+                        },
+                        ObsKind::Bike => "Un vélo couché en travers, classique",
                         ObsKind::Bin => "La poubelle de la rue ! Tarpin dur",
                     };
                     self.hurt(line);
@@ -1545,13 +2316,16 @@ impl Game {
             }
             let near = vec2(cc.x.clamp(t.x, t.x + TRAM_LEN), cc.y.clamp(0.15, TRAM_TOP));
             if near.distance(cc) < cr * 0.8 {
-                if self.mighty() {
+                if self.tank > 0.0 {
+                    self.wreck_tram(k);
+                } else if self.mighty() {
                     self.vy = JUMP_V * 1.3;
                     self.on_ground = false;
                     self.trams[k].rode = true;
                     self.shake(0.4);
                     self.pop(cc + vec2(0.8, 1.0), "BOING !", Color::new(1.0, 0.8, 0.1, 1.0));
-                    self.say("Coup de boule dans le tram B !", "Retard estime : tarpin longtemps");
+                    let title = format!("Coup de boule dans le {} !", self.tram_name());
+                    self.say(&title, "Retard estimé : tarpin longtemps");
                 } else {
                     self.die(Death::Tram);
                     return;
@@ -1568,10 +2342,14 @@ impl Game {
             if c.dead {
                 continue;
             }
+            // Les mouettes ne s'attrapent qu'en deltaplane
+            if c.kind == Kind::Gull && !self.gliding {
+                continue;
+            }
             let r = c.kind.radius();
             if c.center().distance(cc) < cr + r * 0.9 {
                 kills.push(i);
-                if self.vy < 0.0 && !self.slamming && cc.y > c.center().y + 0.15 {
+                if c.kind != Kind::Gull && self.vy < 0.0 && !self.slamming && cc.y > c.center().y + 0.15 {
                     stomp = true;
                 }
             }
@@ -1582,6 +2360,8 @@ impl Game {
         if stomp {
             self.vy = 9.0;
             self.jumps_left = 1;
+            self.glide_left = true;
+            self.gliding = false;
         }
     }
 
@@ -1656,12 +2436,12 @@ impl Game {
                 self.gave = GAVE_TIME;
                 self.gave_count += 1;
                 self.score += 500.0;
-                self.pop(cc + vec2(0.0, 2.2), "MODE GAVE ! +500", Color::new(1.0, 0.85, 0.2, 1.0));
+                self.pop(cc + vec2(0.0, 2.2), "MODE GAVÉ ! +500", Color::new(1.0, 0.85, 0.2, 1.0));
                 if self.first_gave {
                     self.first_gave = false;
-                    self.say("MODE GAVE !", "Tarpin ? A Bordeaux on dit GAVE. Rien ne t'arrete !");
+                    self.say("MODE GAVÉ !", "Tarpin ? A Bordeaux on dit GAVÉ. Rien ne t'arrête !");
                 } else {
-                    self.say("MODE GAVE !", "Gave fort, meme. Fonce dans le tas !");
+                    self.say("MODE GAVÉ !", "Gavé fort, même. Fonce dans le tas !");
                 }
             }
         }
@@ -1676,9 +2456,10 @@ impl Game {
         self.hurt_t = 0.6;
         self.fat = (self.fat - 1.0).max(0.0);
         self.combo = 0;
+        self.gliding = false;
         self.shake(0.25);
         let (cc, _) = self.hit_circle();
-        self.pop(cc + vec2(0.0, 1.0), pick(&["MAOUU !", "AIE !", "FCHHH !"]), Color::new(1.0, 0.5, 0.3, 1.0));
+        self.pop(cc + vec2(0.0, 1.0), pick(&["MAOUU !", "AÏE !", "FCHHH !"]), Color::new(1.0, 0.5, 0.3, 1.0));
         for _ in 0..16 {
             self.particles.push(Particle {
                 kind: PK::Fur,
@@ -1707,6 +2488,7 @@ impl Game {
         self.death = Some(how);
         self.over_t = 0.0;
         self.slamming = false;
+        self.gliding = false;
         self.shake(0.6);
         let (cc, _) = self.hit_circle();
         match how {
@@ -1720,10 +2502,11 @@ impl Game {
                         self.add_splat();
                     }
                 }
-                self.say("Aplati par le tram B", "Acaboulette est tarpin plat. Comme une crepe.");
+                let title = format!("Aplati par le {}", self.tram_name());
+                self.say(&title, "Acaboulette est tarpin plat. Comme une crêpe.");
             }
             Death::KO => {
-                self.say("Acaboulette est KO", "Tarpin fatigue, le gros matou...");
+                self.say("Acaboulette est KO", "Tarpin fatigué, le gros matou...");
             }
             Death::Mine => {
                 if self.gore {
@@ -1756,7 +2539,8 @@ impl Game {
             return;
         }
         // Avale en courant, ou ecrabouille en tombant dessus
-        let eaten = by_cat && self.on_ground && !self.slamming;
+        let in_tank = self.tank > 0.0;
+        let eaten = by_cat && self.on_ground && !self.slamming && !in_tank;
 
         if by_cat {
             self.combo += 1;
@@ -1766,7 +2550,9 @@ impl Game {
             let pts = kind.points() * mult;
             self.score += pts;
             self.bloody = (self.bloody + 0.15).min(1.0);
-            self.fat = (self.fat + kind.fat_gain() * if eaten { 1.0 } else { 0.6 }).min(MAX_FAT);
+            if !in_tank {
+                self.fat = (self.fat + kind.fat_gain() * if eaten { 1.0 } else { 0.6 }).min(MAX_FAT);
+            }
             let word = if eaten {
                 pick(&["MIAM !", "GLOUPS !", "SLURP !", "CRONCH !", "MIAOUM !"])
             } else {
@@ -1783,14 +2569,27 @@ impl Game {
                 }
                 8 => self.say("COMBO x8 !", "TARPIN DE CARNAGE !"),
                 12 => self.say("COMBO x12 !!!", "Allez les Girondins, TARPIN !"),
-                20 => self.say("COMBO x20 !!!", "Bordeaux n'a plus de pigeons. Tarpin."),
-                30 => self.say("COMBO x30 !!!", "La SPA de Bordeaux porte plainte"),
+                20 => {
+                    let town = if self.city() == City::Algerie { "Alger" } else { self.city().name() };
+                    self.say("COMBO x20 !!!", &format!("{town} n'a plus de pigeons. Tarpin."));
+                }
+                30 => {
+                    let town = if self.city() == City::Algerie { "Alger" } else { self.city().name() };
+                    self.say("COMBO x30 !!!", &format!("La SPA de {town} porte plainte"));
+                }
                 _ => {}
             }
             if kind == Kind::Dog && self.kills[ki] == 1 {
-                self.say_tarpin("Un chien avale tout rond !", "Le teckel de la rue Notre-Dame. Tarpin croustillant.");
+                self.say_tarpin("Un chien avalé tout rond !", "Le teckel de la rue Notre-Dame. Tarpin croustillant.");
+            } else if kind == Kind::Gull && self.kills[ki] == 1 && !in_tank {
+                self.say_tarpin("Mouette gobée en plein vol !", "Un petit goût d'iode et de frites volées. Tarpin la classe.");
             } else if kind == Kind::Rat && self.kills[ki] == 1 {
-                self.say_tarpin("Rat de la Garonne", "Ca a un petit gout de vase. Tarpin bon quand meme.");
+                match self.city() {
+                    City::Bordeaux => self.say_tarpin("Rat de la Garonne", "Ça a un petit goût de vase. Tarpin bon quand même."),
+                    City::Marseille => self.say_tarpin("Rat du Vieux-Port", "Nourri à la bouillabaisse. Tarpin bon."),
+                    City::Forcalquier => self.say_tarpin("Rat des champs", "Élevé à la lavande et au banon. Tarpin fin."),
+                    City::Algerie => self.say_tarpin("Rat du port d'Alger", "Un petit goût de sardine grillée. Tarpin bon."),
+                };
             }
         } else {
             self.score += kind.points() * 0.5;
@@ -1800,6 +2599,7 @@ impl Game {
         let dir = if by_cat { vec2(self.speed * 0.6, 2.5) } else { vec2(-4.0, 2.0) };
         let feathers = match kind {
             Kind::Pigeon => Some(Color::new(0.62, 0.64, 0.7, 1.0)),
+            Kind::Gull => Some(WHITE),
             _ => None,
         };
         let amount = match kind {
@@ -1867,9 +2667,9 @@ impl Game {
             );
             let n = self.kills[Kind::Crs as usize];
             if n == 1 {
-                self.say_tarpin("CRS en orbite !", "Il a pas vu venir le matou. Tarpin de vol plane.");
+                self.say_tarpin("CRS en orbite !", "Il a pas vu venir le matou. Tarpin de vol plané.");
             } else if n.is_multiple_of(10) {
-                self.say(&format!("{n} CRS degommes !"), "La prefecture est tarpin enervee");
+                self.say(&format!("{n} CRS dégommés !"), "La préfecture est tarpin énervée");
             }
         } else {
             self.score += Kind::Crs.points() * 0.5;
@@ -2059,6 +2859,20 @@ impl Game {
         let can_obstacle = x > self.no_obstacle_until;
         let roll = gen_range(0.0, 1.0);
 
+        // Un char d'assaut a l'arret, de temps en temps
+        if self.tank == 0.0
+            && self.tank_spots.is_empty()
+            && x > self.next_tank_x
+            && can_obstacle
+            && gen_range(0.0, 1.0) < TANK_CHANCE
+        {
+            self.tank_spots.push(TankSpot { x: x + 5.0 });
+            self.no_obstacle_until = x + 16.0;
+            self.next_tank_x = x + TANK_EVERY;
+            self.next_spawn = x + 14.0;
+            return;
+        }
+
         // Le tram B, de temps en temps
         if x > 140.0 && can_obstacle && roll < 0.06 + 0.06 * d {
             self.trams.push(Tram { x: x + 26.0, warned: false, rode: false });
@@ -2146,6 +2960,18 @@ impl Game {
             }
         }
 
+        // Des mouettes, tout la-haut : il faut le deltaplane
+        if x > 60.0 && gen_range(0.0, 1.0) < 0.14 {
+            let y = gen_range(6.4, 7.4);
+            for i in 0..gen_range(1, 4) {
+                self.spawn_critter(Kind::Gull, x + 6.0 + i as f32 * gen_range(1.6, 2.4));
+                if let Some(g) = self.critters.last_mut() {
+                    g.pos.y = y + gen_range(-0.4, 0.4);
+                    g.base_y = g.pos.y;
+                }
+            }
+        }
+
         if !self.mighty() && x > 250.0 && gen_range(0.0, 1.0) < 0.03 {
             self.pickups.push(Pickup { kind: PickKind::Kebab, pos: vec2(x + gap * 0.3, 1.5), taken: false, phase: 0.0 });
         }
@@ -2158,6 +2984,7 @@ impl Game {
             Kind::Rat => (gen_range(-3.5, -2.0), 0.0),
             Kind::Dog => (gen_range(-3.0, -0.8), 0.0),
             Kind::Crs => (gen_range(-0.6, -0.2), 0.0),
+            Kind::Gull => (gen_range(-1.6, -0.8), 7.0),
         };
         self.critters.push(Critter {
             kind,
@@ -2219,10 +3046,14 @@ impl Game {
             draw_pickup(&v, p, self.time);
         }
         for t in &self.trams {
-            draw_tram(&v, t, night, self.time);
+            draw_tram(&v, t, night, self.time, zone_at(t.x).city());
         }
         for ve in &self.vehicles {
             draw_vehicle(&v, ve, night, self.time);
+        }
+        for t in &self.tank_spots {
+            draw_tank(&v, t.x, 0.0, 0.0, None);
+            draw_tank_arrow(&v, t.x, self.time);
         }
         for c in &self.critters {
             if !c.dead {
@@ -2234,6 +3065,12 @@ impl Game {
         }
         self.draw_particles(&v, true);
         self.draw_cat(&v);
+        for sh in &self.shells {
+            draw_shell(&v, sh.pos, self.time);
+        }
+        for m in &self.missiles {
+            draw_missile(&v, m, self.time);
+        }
         self.draw_particles(&v, false);
         self.draw_weather(&v);
         self.draw_pops(&v);
@@ -2516,9 +3353,9 @@ impl Game {
 
         // les textes
         let (txt, col) = if done {
-            ("Ahhh... ca va tarpin mieux ! MODE GAVE !", Color::new(1.0, 0.9, 0.3, 1.0))
+            ("Ahhh... ça va tarpin mieux ! MODE GAVÉ !", Color::new(1.0, 0.9, 0.3, 1.0))
         } else {
-            ("Je suis tarpin gave... pause litiere !", Color::new(1.0, 1.0, 1.0, 1.0))
+            ("Je suis tarpin gavé... pause litière !", Color::new(1.0, 1.0, 1.0, 1.0))
         };
         let mut size = 54u16;
         while size > 20 && measure_text(txt, None, size, 1.0).width > w - 60.0 {
@@ -2559,8 +3396,10 @@ impl Game {
     fn draw_sky(&self, v: &View, night: f32, sunset: f32) {
         let w = screen_width();
         let h = v.p(Vec2::ZERO).y;
-        let day_top = Color::new(0.35, 0.6, 0.92, 1.0);
-        let day_bot = Color::new(0.75, 0.88, 0.98, 1.0);
+        // a Marseille : grand ciel bleu
+        let med = self.sunny();
+        let day_top = mix(Color::new(0.35, 0.6, 0.92, 1.0), Color::new(0.12, 0.48, 0.95, 1.0), med);
+        let day_bot = mix(Color::new(0.75, 0.88, 0.98, 1.0), Color::new(0.6, 0.85, 1.0, 1.0), med);
         let set_top = Color::new(0.45, 0.35, 0.65, 1.0);
         let set_bot = Color::new(1.0, 0.6, 0.35, 1.0);
         let night_top = Color::new(0.02, 0.03, 0.1, 1.0);
@@ -2599,6 +3438,7 @@ impl Game {
             let cy = h * (0.1 + 0.25 * hash(i, 22));
             let col = mix(Color::new(1.0, 1.0, 1.0, 0.85), Color::new(0.4, 0.4, 0.55, 0.5), night);
             let col = mix(col, Color::new(1.0, 0.75, 0.6, 0.85), sunset * (1.0 - night));
+            let col = with_alpha(col, col.a * (1.0 - 0.8 * med)); // le mistral a chasse les nuages
             for k in 0..4 {
                 let r = 22.0 + hash(i * 5 + k, 23) * 22.0;
                 draw_circle(cx + k as f32 * 30.0, cy + (k as f32 - 1.5).abs() * 6.0, r, col);
@@ -2618,8 +3458,65 @@ impl Game {
         let bw = 5.0;
         let i0 = (l / bw).floor() as i32 - 1;
         let i1 = (r / bw).ceil() as i32 + 1;
+        let med = self.sunny();
         for i in i0..=i1 {
             let x0 = i as f32 * bw;
+            let fz = zone_at(x0 / 0.08);
+            if fz == Zone::Sahara {
+                // le Sahara : des dunes a perte de vue
+                let dh = 3.0 + hash(i, 53) * 5.0;
+                half_ellipse(&far, x0 + bw * 0.5, 0.0, bw * 1.6, dh, fogk(SAND, 0.35));
+                half_ellipse(&far, x0 + bw * 1.1, 0.0, bw * 1.1, dh * 0.6, fogk(darker(SAND, 0.88), 0.35));
+                continue;
+            }
+            if fz.city() == City::Algerie {
+                // Alger la Blanche, en gradins sur ses collines
+                let hill = 5.0 + hash(i, 51) * 6.0;
+                half_ellipse(&far, x0 + bw * 0.5, 0.0, bw * 1.5, hill, fogk(Color::new(0.5, 0.6, 0.42, 1.0), 0.5));
+                for k in 0..5 {
+                    let hx = x0 + hash(i * 5 + k, 54) * bw;
+                    let hy = hash(i * 5 + k, 55) * hill * 0.6;
+                    let hw = 0.8 + hash(i * 5 + k, 56) * 0.9;
+                    rect(&far, hx, hy, hx + hw, hy + 0.9 + hash(i * 5 + k, 57), fogk(Color::new(0.97, 0.97, 0.95, 1.0), 0.4));
+                }
+                continue;
+            }
+            if fz.city() == City::Forcalquier {
+                // la montagne de Lure, des collines et des cypres
+                let lure = 11.0 + hash(i, 51) * 6.0;
+                tri(&far, vec2(x0 - bw * 2.5, 0.0), vec2(x0 + bw * 3.5, 0.0), vec2(x0 + bw * 0.5, lure), fogk(Color::new(0.5, 0.58, 0.75, 1.0), 0.6));
+                let hill = 2.5 + hash(i, 52) * 3.0;
+                half_ellipse(&far, x0 + bw * 0.5, 0.0, bw * 1.4, hill, fogk(Color::new(0.55, 0.62, 0.38, 1.0), 0.45));
+                if hash(i, 59) < 0.6 {
+                    // un champ de lavande a flanc de colline
+                    for k in 0..4 {
+                        let yy = 0.2 + k as f32 * hill * 0.14;
+                        rect(&far, x0 + bw * 0.1 + k as f32 * 0.4, yy, x0 + bw * 1.1 - k as f32 * 0.3, yy + hill * 0.08, fogk(LAVENDER, 0.35));
+                    }
+                }
+                if hash(i, 58) < 0.5 {
+                    let cx = x0 + bw * 0.3;
+                    tri(&far, vec2(cx - 0.35, hill * 0.6), vec2(cx + 0.35, hill * 0.6), vec2(cx, hill * 0.6 + 3.2), fogk(Color::new(0.2, 0.35, 0.22, 1.0), 0.4));
+                } else {
+                    let hh = 1.0 + hash(i, 1);
+                    rect(&far, x0 + 1.0, hill * 0.7, x0 + 2.6, hill * 0.7 + hh, fogk(Color::new(0.9, 0.82, 0.66, 1.0), 0.45));
+                    tri(&far, vec2(x0 + 0.8, hill * 0.7 + hh), vec2(x0 + 2.8, hill * 0.7 + hh), vec2(x0 + 1.8, hill * 0.7 + hh + 0.6), fogk(TILE, 0.45));
+                }
+                continue;
+            }
+            if fz.city() == City::Marseille {
+                // Marseille : collines de calcaire, maisons aux toits de tuiles
+                let hill = 5.0 + hash(i, 51) * 9.0;
+                tri(&far, vec2(x0 - bw * 1.2, 0.0), vec2(x0 + bw * 2.2, 0.0), vec2(x0 + bw * 0.5, hill), fogk(LIMESTONE, 0.5));
+                tri(&far, vec2(x0 + bw * 0.5, hill), vec2(x0 + bw * 2.2, 0.0), vec2(x0 + bw * 1.1, 0.0), fogk(darker(LIMESTONE, 0.85), 0.5));
+                if hash(i, 52) < 0.6 {
+                    tri(&far, vec2(x0 - bw * 0.2, 0.0), vec2(x0 + bw * 1.4, 0.0), vec2(x0 + bw * 0.6, hill * 0.45), fogk(Color::new(0.45, 0.55, 0.35, 1.0), 0.5));
+                }
+                let hh = 1.2 + hash(i, 1) * 2.2;
+                rect(&far, x0, 0.0, x0 + bw * 0.6, hh, fogk(Color::new(0.93, 0.8, 0.6, 1.0), 0.45));
+                tri(&far, vec2(x0 - 0.2, hh), vec2(x0 + bw * 0.6 + 0.2, hh), vec2(x0 + bw * 0.3, hh + 0.7), fogk(TILE, 0.45));
+                continue;
+            }
             let hh = 3.0 + hash(i, 1) * 5.0;
             rect(&far, x0, 0.0, x0 + bw * 0.95, hh, fogk(STONE_SHADE, 0.55));
             tri(&far, vec2(x0, hh), vec2(x0 + bw * 0.95, hh), vec2(x0 + bw * 0.5, hh + 1.5), fogk(SLATE, 0.5));
@@ -2632,14 +3529,15 @@ impl Game {
         }
         // La Garonne
         let water_top = bank_sy;
-        let wc = mix(fogk(GARONNE, 0.2), Color::new(0.08, 0.08, 0.12, 1.0), night * 0.5);
+        // La Garonne... ou la Mediterranee
+        let wc = mix(fogk(self.band_col(), 0.2), Color::new(0.08, 0.08, 0.12, 1.0), night * 0.5);
         draw_rectangle(0.0, water_top, screen_width(), gs - water_top, wc);
         for k in 0..12 {
             let y = water_top + (k as f32 + 0.5) / 12.0 * (gs - water_top);
             let off = (self.pos.x * 0.5 * v.s * (0.3 + k as f32 * 0.05) + k as f32 * 70.0).rem_euclid(140.0);
             let mut x = -off;
             while x < screen_width() {
-                draw_line(x, y, x + 40.0, y, 2.0, darker(wc, 0.85));
+                draw_line(x, y, x + 40.0, y, 2.0, mix(darker(wc, 0.85), Color::new(1.0, 1.0, 1.0, 1.0), med * 0.18 * (1.0 - night)));
                 x += 140.0;
             }
         }
@@ -2670,10 +3568,14 @@ impl Game {
             if lh > 0.0 && (xc - lx).abs() < lh + bw * 0.5 {
                 continue;
             }
-            draw_facade(&mid, i, x0, bw, zone, night);
+            if zone.city() == City::Bordeaux {
+                draw_facade(&mid, i, x0, bw, zone, night);
+            } else {
+                draw_facade_south(&mid, i, x0, bw, zone, night);
+            }
         }
         for zi in zl..=zr {
-            let zone = ZONES[zi.rem_euclid(ZONES.len() as i32) as usize];
+            let zone = zone_of(zi);
             let lx = (zi as f32 * ZONE_LEN + ZONE_LEN * 0.5) * f;
             draw_landmark(&mid, zone, lx, night, self.time);
         }
@@ -2686,7 +3588,7 @@ impl Game {
         let mut x = (l / 1.0).floor();
         while x < r + 1.0 {
             let z = zone_at(x);
-            if z.river() || z == Zone::Bourse {
+            if (z.river() && z != Zone::Sahara && z.city() != City::Forcalquier) || z == Zone::Bourse {
                 rect(v, x, 0.0, x + 1.02, 0.75, darker(STONE_SHADE, 1.0 - 0.5 * night));
                 rect(v, x, 0.75, x + 1.02, 0.85, darker(STONE, 1.0 - 0.5 * night));
                 if z == Zone::PontDePierre {
@@ -2760,6 +3662,16 @@ impl Game {
                 Zone::PontDePierre => {
                     rect(v, x, -0.3, x + 1.02, 0.0, darker(Color::new(0.4, 0.4, 0.42, 1.0), dk));
                 }
+                _ if z.city() != City::Bordeaux => {
+                    // au soleil : pas de gazon, des paves, de l'herbe seche ou du sable
+                    let (a, b) = match (z, z.city()) {
+                        (Zone::Sahara, _) => (SAND, Color::new(0.9, 0.74, 0.46, 1.0)),
+                        (_, City::Forcalquier) => (Color::new(0.8, 0.76, 0.48, 1.0), Color::new(0.74, 0.72, 0.44, 1.0)),
+                        (_, City::Algerie) => (Color::new(0.9, 0.87, 0.8, 1.0), Color::new(0.82, 0.8, 0.74, 1.0)),
+                        _ => (Color::new(0.83, 0.72, 0.58, 1.0), Color::new(0.78, 0.66, 0.52, 1.0)),
+                    };
+                    rect(v, x, -0.35, x + 1.02, 0.0, darker(if (x as i32).rem_euclid(2) == 0 { a } else { b }, dk));
+                }
                 _ => {
                     rect(v, x, -0.35, x + 1.02, 0.0, darker(Color::new(0.35, 0.6, 0.25, 1.0), dk));
                     for k in 0..4 {
@@ -2770,12 +3682,16 @@ impl Game {
             }
             x += 1.0;
         }
-        // Rails
+        // Rails (seulement la ou roule un tram : Bordeaux et Alger)
         let rail = darker(Color::new(0.65, 0.66, 0.7, 1.0), dk);
-        let p0 = v.p(vec2(l, -0.08));
-        draw_rectangle(0.0, p0.y, w, v.l(0.05), rail);
-        let p1 = v.p(vec2(l, -0.26));
-        draw_rectangle(0.0, p1.y, w, v.l(0.05), rail);
+        let mut x = l.floor();
+        while x < r + 1.0 {
+            if matches!(zone_at(x).city(), City::Bordeaux | City::Algerie) {
+                rect(v, x, -0.13, x + 1.02, -0.08, rail);
+                rect(v, x, -0.31, x + 1.02, -0.26, rail);
+            }
+            x += 1.0;
+        }
 
         // Brume du Miroir d'eau
         let cycle = (self.time / 9.0).fract();
@@ -2900,6 +3816,12 @@ impl Game {
     // -----------------------------------------------------------------------
 
     fn draw_cat(&self, v: &View) {
+        if self.tank > 0.0 && self.phase == Phase::Running {
+            // dans le char : seule la tete depasse de la tourelle
+            let blink = self.tank < 2.0 && (self.time * 14.0).sin() < 0.0;
+            draw_tank(v, self.pos.x - TANK_SEAT, self.run_phase, self.tank_recoil, Some(blink));
+            return;
+        }
         if self.invuln > 0.0 && self.phase == Phase::Running && (self.time * 14.0).sin() > 0.3 {
             return;
         }
@@ -2921,7 +3843,16 @@ impl Game {
         let bob = if self.on_ground && !dead && !title { (ph * 2.0).sin().abs() * 0.06 } else { 0.0 };
         let feet = self.pos;
         let c = feet + vec2(0.0, (0.2 + r * 0.85) * sy + bob);
-        let lean = if self.slamming { -0.25 } else if airborne { (self.vy * 0.02).clamp(-0.2, 0.2) } else { 0.0 };
+        let gliding = self.gliding && airborne;
+        let lean = if self.slamming {
+            -0.25
+        } else if gliding {
+            (self.vy * 0.08).clamp(-0.25, 0.5) // le nez suit la trajectoire
+        } else if airborne {
+            (self.vy * 0.02).clamp(-0.2, 0.2)
+        } else {
+            0.0
+        };
         let rot = Vec2::from_angle(lean);
         let at = |lx: f32, ly: f32| c + rot.rotate(vec2(lx * sx, ly * sy));
 
@@ -2974,6 +3905,29 @@ impl Game {
             prev = p;
         }
 
+        // Deltaplane (triple saut) : l'aile, derriere le chat
+        let glide_bar = at(r * 1.15, r * 0.15); // la barre de controle
+        let glide_mast = at(r * 0.15, r * 2.02);
+        if gliding {
+            let open = (self.glide_age / 0.18).min(1.0);
+            // l'aile clignote quand elle va se replier
+            let a = if self.glide_t > GLIDE_MAX - 0.9 && (self.time * 16.0).sin() < 0.0 { 0.45 } else { 1.0 };
+            let nose = at(r * 2.9, r * 1.9);
+            let keel = at(-r * 2.5, r * 2.15);
+            let tip_far = keel.lerp(at(-r * 1.5, r * 3.5), open);
+            let tip_near = keel.lerp(at(-r * 2.3, r * 1.3), open);
+            tri(v, nose, keel, tip_far, Color::new(0.75, 0.1, 0.15, a));
+            tri(v, nose, keel, tip_near, Color::new(0.95, 0.2, 0.2, a));
+            tri(v, nose, keel.lerp(tip_near, 0.45), tip_near, Color::new(1.0, 0.85, 0.2, a));
+            let tube = Color::new(0.85, 0.85, 0.9, a);
+            line(v, nose, keel, 0.06, tube);
+            line(v, nose, tip_far, 0.05, tube);
+            line(v, nose, tip_near, 0.05, tube);
+            // trapeze et sangle du harnais
+            line(v, glide_mast, glide_bar, 0.05, tube);
+            line(v, glide_mast, at(-r * 0.3, r * 0.9), 0.04, Color::new(0.15, 0.15, 0.2, a));
+        }
+
         // Pattes du fond
         let leg = |front: bool, far: bool| -> (Vec2, Vec2) {
             let hx = if front { r * 0.7 } else { -r * 0.75 };
@@ -2981,6 +3935,9 @@ impl Game {
             let mut foot;
             if dead {
                 foot = hip + vec2(if front { 0.25 } else { -0.25 }, -0.12);
+            } else if gliding {
+                // pattes avant sur la barre, pattes arriere qui trainent
+                foot = if front { glide_bar } else { hip + rot.rotate(vec2(-0.45, -0.08)) };
             } else if airborne || self.slamming {
                 let ext = if self.slamming { 0.1 } else { 0.4 };
                 foot = hip + vec2(if front { ext } else { -ext }, -0.22);
@@ -3146,12 +4103,16 @@ impl Game {
         // Jauges des bonus : en bas, au milieu (empilees si les deux sont actives)
         if self.phase == Phase::Running {
             let mut slot = 0;
+            if self.tank > 0.0 {
+                bottom_gauge("CHAR D'ASSAUT", self.tank / TANK_TIME, self.tank < 2.0, Color::new(0.14, 0.2, 0.08, 0.85), Color::new(0.55, 0.8, 0.25, 1.0), slot, self.time);
+                slot += 1;
+            }
             if self.kebab > 0.0 {
                 bottom_gauge("KEBAB TURBO", self.kebab / KEBAB_TIME, self.kebab < 1.5, Color::new(0.55, 0.12, 0.02, 0.85), Color::new(1.0, 0.45, 0.1, 1.0), slot, self.time);
                 slot += 1;
             }
             if self.gave > 0.0 {
-                bottom_gauge("MODE GAVE", self.gave / GAVE_TIME, self.gave < 1.5, Color::new(0.5, 0.35, 0.0, 0.85), Color::new(1.0, 0.85, 0.2, 1.0), slot, self.time);
+                bottom_gauge("MODE GAVÉ", self.gave / GAVE_TIME, self.gave < 1.5, Color::new(0.5, 0.35, 0.0, 0.85), Color::new(1.0, 0.85, 0.2, 1.0), slot.min(1), self.time);
             }
         }
 
@@ -3171,8 +4132,10 @@ impl Game {
                     let blink = (self.time * 10.0).sin() > 0.0;
                     let col = if blink { Color::new(1.0, 0.85, 0.1, 1.0) } else { Color::new(0.9, 0.1, 0.1, 1.0) };
                     draw_triangle(vec2(w - 10.0, y), vec2(w - 50.0, y - 26.0), vec2(w - 50.0, y + 26.0), col);
-                    let tw = measure_text("TRAM B", None, 26, 1.0).width;
-                    draw_text("TRAM B", w - 60.0 - tw, y + 9.0, 26.0, col);
+                    let label = self.tram_name().to_uppercase();
+                    let label = label.as_str();
+                    let tw = measure_text(label, None, 26, 1.0).width;
+                    draw_text(label, w - 60.0 - tw, y + 9.0, 26.0, col);
                 }
             }
         }
@@ -3180,7 +4143,7 @@ impl Game {
         // Aide de depart
         if self.phase == Phase::Running && self.time < 9.0 && !self.mighty() {
             let a = (9.0 - self.time).min(1.0);
-            let hint = "Espace / clic : sauter (2x, maintenir = plus haut)   -   Bas / clic droit : PLAT VENTRE";
+            let hint = "Espace / clic : sauter (2x, puis DELTAPLANE)   -   Bas / clic droit : PLAT VENTRE";
             let size = 22u16;
             let tw = measure_text(hint, None, size, 1.0).width;
             round_rect(w / 2.0 - tw / 2.0 - 12.0, h - 54.0, tw + 24.0, 36.0, 10.0, Color::new(0.0, 0.0, 0.0, 0.5 * a));
@@ -3220,14 +4183,17 @@ impl Game {
         round_rect(bx, 40.0, bw, 360.0, 16.0, Color::new(0.2, 0.03, 0.07, 0.8));
         let wob = (self.time * 3.0).sin() * 3.0;
         comic_text("ACABOULETTE", w / 2.0, 100.0 + wob, 80, GINGER, Color::new(0.3, 0.05, 0.02, 1.0));
-        centered("Le gros matou roux qui ecrabouille Bordeaux", 158.0, 28, Color::new(1.0, 0.9, 0.7, 1.0));
+        let city = CITIES[start_city()];
+        let town = if city == City::Algerie { "Alger" } else { city.name() };
+        centered(&format!("Le gros matou roux qui écrabouille {town}"), 158.0, 28, Color::new(1.0, 0.9, 0.7, 1.0));
+        let intro = format!("Il a la dalle, et {town} regorge de casse-croûte :");
         let lines = [
-            "Il a la dalle, et Bordeaux regorge de casse-croute :",
+            intro.as_str(),
             "pigeons, rats, chiens... il gobe tout ce qui passe !",
-            "Plus il mange, plus il grossit... jusqu'a la pause",
-            "litiere. Et la : MODE GAVE, il defonce tout. Tarpin !",
+            "Plus il mange, plus il grossit... jusqu'à la pause",
+            "litière. Et là : MODE GAVÉ, il défonce tout. Tarpin !",
             "Un kebab ? TURBO. Un barrage de CRS ? BONUS.",
-            "Gare au mobilier, aux voitures, au tram B et aux MINES.",
+            "Gare au mobilier, aux voitures, au tram et aux MINES.",
         ];
         for (i, l) in lines.iter().enumerate() {
             centered(l, 206.0 + i as f32 * 28.0, 22, Color::new(1.0, 1.0, 1.0, 0.9));
@@ -3235,8 +4201,20 @@ impl Game {
         if self.best > 0 {
             centered(&format!("Record : {}", self.best), 380.0, 24, Color::new(1.0, 0.85, 0.2, 1.0));
         }
+        // Choix de la ville de depart
+        let sel = start_city();
+        let hover = city_button_at(mouse_position());
+        for (k, (bx, by, bw, bh)) in city_buttons().into_iter().enumerate() {
+            let on = k == sel;
+            let lit = on || hover == Some(k);
+            round_rect(bx - 3.0, by - 3.0, bw + 6.0, bh + 6.0, 13.0, if on { Color::new(1.0, 0.85, 0.2, 1.0) } else { Color::new(0.1, 0.0, 0.03, 0.9) });
+            round_rect(bx, by, bw, bh, 10.0, if lit { Color::new(0.5, 0.1, 0.2, 1.0) } else { Color::new(0.28, 0.05, 0.11, 0.95) });
+            let size = if bw < 150.0 { 20 } else { 26 };
+            comic_text(CITIES[k].name(), bx + bw / 2.0, by + bh / 2.0, size, if lit { WHITE } else { Color::new(1.0, 0.9, 0.75, 1.0) }, Color::new(0.1, 0.0, 0.03, 1.0));
+        }
         let a = 0.6 + 0.4 * (self.time * 4.0).sin();
-        comic_text("Clique pour commencer !", w / 2.0, h * 0.9, 34, Color::new(1.0, 1.0, 1.0, a), Color::new(0.3, 0.02, 0.05, a));
+        comic_text("Clique sur ta ville de départ !", w / 2.0, h * 0.9, 34, Color::new(1.0, 1.0, 1.0, a), Color::new(0.3, 0.02, 0.05, a));
+        centered("(ou flèches gauche / droite, puis Espace)", h * 0.9 + 34.0, 20, Color::new(1.0, 1.0, 1.0, 0.75));
         let gore_txt = if self.gore { "Gore : OUI (G)" } else { "Gore : non (G)" };
         draw_text(gore_txt, w - 150.0, h - 14.0, 20.0, Color::new(1.0, 1.0, 1.0, 0.7));
     }
@@ -3244,13 +4222,13 @@ impl Game {
     fn draw_game_over(&self) {
         let w = screen_width();
         let h = screen_height();
-        let bw = 520.0f32.min(w - 32.0);
+        let bw = 700.0f32.min(w - 32.0);
         let bh = 300.0;
         let bx = w / 2.0 - bw / 2.0;
         let by = h * 0.38;
         round_rect(bx, by, bw, bh, 16.0, Color::new(0.1, 0.02, 0.04, 0.85));
         let title = match self.death {
-            Some(Death::Tram) => "EN CREPE !",
+            Some(Death::Tram) => "EN CRÊPE !",
             Some(Death::Mine) => "EN MORCEAUX !",
             _ => "TARPIN FINI !",
         };
@@ -3259,7 +4237,7 @@ impl Game {
         centered(&format!("Score : {}   ({} m)", self.total(), self.pos.x.max(0.0) as u32), y0, 30, WHITE);
         let k = self.kills;
         centered(
-            &format!("Pigeons {}  -  Rats {}  -  Chiens {}  -  CRS {}", k[0], k[1], k[2], k[3]),
+            &format!("Pigeons {}  -  Rats {}  -  Chiens {}  -  CRS {}  -  Mouettes {}", k[0], k[1], k[2], k[3], k[4]),
             y0 + 36.0,
             22,
             LIGHTGRAY,
@@ -3272,7 +4250,7 @@ impl Game {
             centered(&format!("Record : {}", self.best), y0 + 108.0, 26, Color::new(1.0, 0.85, 0.2, 1.0));
         }
         if self.over_t > 1.2 {
-            centered("Clic / Espace : rejouer   -   Echap : quitter", by + bh - 18.0, 22, Color::new(1.0, 1.0, 1.0, 0.85));
+            centered("Clic / Espace : rejouer  -  V : autre ville  -  Échap : quitter", by + bh - 18.0, 22, Color::new(1.0, 1.0, 1.0, 0.85));
         }
     }
 }
@@ -3459,7 +4437,7 @@ fn draw_landmark(v: &View, zone: Zone, x: f32, night: f32, time: f32) {
             rect(v, x - 12.0, 0.0, x + 12.0, 1.0, shade);
         }
         Zone::CiteDuVin => {
-            // La Cite du Vin : la carafe doree qui tourbillonne
+            // La Cité du Vin : la carafe doree qui tourbillonne
             let gold = darker(Color::new(0.85, 0.7, 0.4, 1.0), dk);
             let gold2 = darker(Color::new(0.7, 0.55, 0.3, 1.0), dk);
             for k in 0..14 {
@@ -3499,6 +4477,612 @@ fn draw_landmark(v: &View, zone: Zone, x: f32, night: f32, time: f32) {
                 circ(v, vec2(x + 14.0, 19.0), 0.3, Color::new(1.0, 0.2, 0.2, night));
             }
         }
+        Zone::VieuxPort => {
+            // Le Vieux-Port : fort Saint-Jean, voiliers et barques de pecheurs
+            let pink = darker(Color::new(0.9, 0.75, 0.62, 1.0), dk);
+            rect(v, x - 34.0, 0.0, x - 22.0, 6.0, pink);
+            rect(v, x - 30.0, 6.0, x - 25.0, 13.0, darker(pink, 0.92));
+            for k in 0..5 {
+                rect(v, x - 30.0 + k as f32 * 1.1, 13.0, x - 29.4 + k as f32 * 1.1, 13.8, darker(pink, 0.92));
+            }
+            rect(v, x - 28.0, 9.0, x - 27.0, 10.6, window_col(night, false));
+            for k in -6..=7 {
+                let bx = x + k as f32 * 6.5 + hash(k, 61) * 2.0;
+                if bx < x - 21.0 {
+                    continue;
+                }
+                let bob = (time * 1.5 + k as f32).sin() * 0.12;
+                let by = 0.9 + bob;
+                let hull = [WHITE, Color::new(0.2, 0.45, 0.75, 1.0), Color::new(0.85, 0.25, 0.2, 1.0), Color::new(0.95, 0.8, 0.3, 1.0)][((hash(k, 62) * 4.0) as usize).min(3)];
+                let len = 2.2 + hash(k, 63) * 1.6;
+                rect(v, bx - len, by, bx + len, by + 0.8, darker(hull, dk));
+                tri(v, vec2(bx + len, by), vec2(bx + len, by + 0.8), vec2(bx + len + 1.0, by + 0.8), darker(hull, dk));
+                rect(v, bx - len, by + 0.6, bx + len + 0.8, by + 0.8, darker(Color::new(0.2, 0.25, 0.35, 1.0), dk));
+                if hash(k, 64) < 0.7 {
+                    let mh = 6.0 + hash(k, 65) * 5.0;
+                    line(v, vec2(bx, by + 0.8), vec2(bx, by + mh), 0.12, darker(Color::new(0.9, 0.9, 0.88, 1.0), dk));
+                    line(v, vec2(bx, by + 1.6), vec2(bx - len * 0.9, by + 1.4), 0.1, darker(Color::new(0.9, 0.9, 0.88, 1.0), dk));
+                    if hash(k, 66) < 0.5 {
+                        tri(v, vec2(bx + 0.15, by + 1.8), vec2(bx + 0.15, by + mh - 0.3), vec2(bx + len * 0.9, by + 1.8), darker(Color::new(0.98, 0.97, 0.93, 1.0), dk));
+                    }
+                } else {
+                    rect(v, bx - 0.6, by + 0.8, bx + 0.7, by + 1.7, darker(WHITE, dk * 0.95));
+                }
+            }
+        }
+        Zone::Canebiere => {
+            // L'eglise des Reformes, en haut de la Canebiere
+            let pale = darker(Color::new(0.93, 0.9, 0.82, 1.0), dk);
+            let pale2 = darker(Color::new(0.82, 0.79, 0.7, 1.0), dk);
+            rect(v, x - 5.0, 0.0, x + 5.0, 8.5, pale);
+            tri(v, vec2(x - 5.0, 8.5), vec2(x + 5.0, 8.5), vec2(x, 11.5), pale2);
+            for sx in [-4.0, 4.0] {
+                rect(v, x + sx - 1.3, 0.0, x + sx + 1.3, 11.5, pale2);
+                rect(v, x + sx - 0.4, 8.0, x + sx + 0.4, 10.6, window_col(night, false));
+                tri(v, vec2(x + sx - 1.3, 11.5), vec2(x + sx + 1.3, 11.5), vec2(x + sx, 16.5), pale);
+            }
+            circ(v, vec2(x, 6.4), 1.3, window_col(night, true));
+            for k in -1..=1 {
+                half_ellipse(v, x + k as f32 * 2.4, 0.0, 0.9, 3.4, darker(INK, 1.5));
+            }
+        }
+        Zone::Panier => {
+            // La Vieille Charite : arcades de pierre rose et coupole ovale
+            let rose = darker(Color::new(0.93, 0.78, 0.68, 1.0), dk);
+            let rose2 = darker(Color::new(0.82, 0.66, 0.56, 1.0), dk);
+            rect(v, x - 10.0, 0.0, x + 10.0, 8.4, rose);
+            for f in 0..3 {
+                for k in 0..9 {
+                    let ax = x - 9.0 + k as f32 * 2.25;
+                    let ay = 0.3 + f as f32 * 2.7;
+                    rect(v, ax - 0.7, ay, ax + 0.7, ay + 1.4, darker(INK, 1.6));
+                    half_ellipse(v, ax, ay + 1.4, 0.7, 0.7, darker(INK, 1.6));
+                }
+                rect(v, x - 10.1, 2.6 + f as f32 * 2.7, x + 10.1, 2.85 + f as f32 * 2.7, rose2);
+            }
+            rect(v, x - 10.3, 8.4, x + 10.3, 9.0, darker(TILE, dk));
+            // la chapelle au milieu
+            rect(v, x - 3.2, 0.0, x + 3.2, 10.5, rose2);
+            for k in 0..4 {
+                rect(v, x - 2.6 + k as f32 * 1.6, 0.0, x - 2.2 + k as f32 * 1.6, 9.0, rose);
+            }
+            tri(v, vec2(x - 3.5, 9.0), vec2(x + 3.5, 9.0), vec2(x, 11.2), rose);
+            rect(v, x - 2.6, 10.5, x + 2.6, 12.5, rose2);
+            half_ellipse(v, x, 12.5, 2.8, 3.6, darker(Color::new(0.75, 0.72, 0.66, 1.0), dk));
+            rect(v, x - 0.25, 16.0, x + 0.25, 17.4, rose2);
+        }
+        Zone::BonneMere => {
+            // Notre-Dame de la Garde sur sa colline, la Bonne Mere tout en haut
+            let rock = darker(LIMESTONE, dk);
+            let green = darker(Color::new(0.42, 0.55, 0.32, 1.0), dk);
+            half_ellipse(v, x, 0.0, 15.0, 6.6, rock);
+            half_ellipse(v, x - 5.0, 0.0, 8.0, 4.0, green);
+            half_ellipse(v, x + 7.0, 0.0, 6.0, 3.0, green);
+            for k in 0..7 {
+                let hx = x - 9.0 + k as f32 * 3.0;
+                let hy = 0.6 + hash(k, 71) * 2.2;
+                rect(v, hx, hy, hx + 1.6, hy + 1.3, darker(Color::new(0.95, 0.85, 0.65, 1.0), dk));
+                tri(v, vec2(hx - 0.2, hy + 1.3), vec2(hx + 1.8, hy + 1.3), vec2(hx + 0.8, hy + 2.0), darker(TILE, dk));
+            }
+            // la basilique, rayee blanc et vert
+            let up = lowered(v, 4.2);
+            let v = &up;
+            let white = darker(Color::new(0.96, 0.94, 0.88, 1.0), dk);
+            let stripe = darker(Color::new(0.45, 0.55, 0.45, 1.0), dk);
+            rect(v, x - 4.5, 10.0, x + 3.0, 14.0, white);
+            for k in 0..4 {
+                rect(v, x - 4.5, 10.5 + k as f32 * 0.9, x + 3.0, 10.8 + k as f32 * 0.9, stripe);
+            }
+            half_ellipse(v, x - 2.6, 14.0, 1.7, 1.9, stripe);
+            rect(v, x + 1.0, 10.0, x + 3.6, 20.0, white);
+            for k in 0..9 {
+                rect(v, x + 1.0, 10.6 + k as f32 * 1.05, x + 3.6, 10.9 + k as f32 * 1.05, stripe);
+            }
+            rect(v, x + 1.9, 16.2, x + 2.7, 18.2, darker(INK, 1.6));
+            rect(v, x + 1.5, 20.0, x + 3.1, 21.6, white);
+            // la Vierge doree
+            let gold = mix(darker(GOLD, dk), Color::new(1.0, 0.9, 0.4, 1.0), night * 0.5);
+            ellipse(v, vec2(x + 2.3, 23.0), 0.5, 1.5, 0.0, gold);
+            circ(v, vec2(x + 2.3, 24.7), 0.42, gold);
+            circ(v, vec2(x + 1.7, 23.6), 0.3, gold); // l'enfant
+        }
+        Zone::Velodrome => {
+            // Le Velodrome et son grand toit blanc tout en vagues
+            let white = darker(Color::new(0.96, 0.96, 0.97, 1.0), dk);
+            let grey = darker(Color::new(0.8, 0.82, 0.86, 1.0), dk);
+            let om = darker(Color::new(0.2, 0.62, 0.9, 1.0), dk);
+            rect(v, x - 15.0, 0.0, x + 15.0, 6.0, darker(Color::new(0.6, 0.62, 0.66, 1.0), dk));
+            for k in 0..15 {
+                rect(v, x - 14.5 + k as f32 * 2.0, 0.6, x - 13.2 + k as f32 * 2.0, 5.0, if k % 2 == 0 { om } else { white });
+            }
+            half_ellipse(v, x - 8.0, 6.0, 9.5, 8.5, grey);
+            half_ellipse(v, x + 8.0, 6.0, 9.5, 8.5, grey);
+            half_ellipse(v, x, 6.0, 12.0, 6.0, white);
+            half_ellipse(v, x - 9.0, 6.0, 8.0, 7.2, white);
+            half_ellipse(v, x + 9.0, 6.0, 8.0, 7.2, white);
+            for k in -8..=8 {
+                let lx = x + k as f32 * 2.0;
+                line(v, vec2(lx, 6.0), vec2(lx + k as f32 * 0.25, 10.2 - (k as f32).abs() * 0.1), 0.06, grey);
+            }
+            rect(v, x - 17.0, 5.6, x + 17.0, 6.2, grey);
+            let sp = v.p(vec2(x, 3.0));
+            comic_text("DROIT AU BUT", sp.x, sp.y, (v.l(1.5) as u16).max(10), WHITE, darker(om, 0.6));
+            if night > 0.3 {
+                for sx in [-16.0, 16.0] {
+                    circ(v, vec2(x + sx, 13.0), 0.9, Color::new(1.0, 1.0, 0.85, night));
+                }
+            }
+        }
+        Zone::Corniche => {
+            // Au large : le chateau d'If sur son ile, et quelques voiles
+            let rock = darker(LIMESTONE, dk);
+            let fort = darker(Color::new(0.88, 0.8, 0.66, 1.0), dk);
+            half_ellipse(v, x, 1.2, 13.0, 2.6, rock);
+            half_ellipse(v, x + 16.0, 1.2, 6.0, 1.3, darker(rock, 0.93));
+            rect(v, x - 5.0, 3.2, x + 5.0, 6.2, fort);
+            for sx in [-5.0, 0.0, 5.0f32] {
+                rect(v, x + sx - 1.3, 3.0, x + sx + 1.3, 7.4, darker(fort, 0.93));
+                rect(v, x + sx - 1.5, 7.4, x + sx + 1.5, 7.8, fort);
+            }
+            rect(v, x - 0.3, 4.6, x + 0.3, 5.6, darker(INK, 1.6));
+            for k in [-4i32, -3, 3, 4, 5] {
+                let bx = x + k as f32 * 9.0 + hash(k, 81) * 4.0;
+                let by = 1.4 + (time * 1.3 + k as f32).sin() * 0.1;
+                rect(v, bx - 1.2, by, bx + 1.2, by + 0.4, darker(WHITE, dk));
+                tri(v, vec2(bx, by + 0.5), vec2(bx, by + 4.0), vec2(bx + 1.6, by + 0.5), darker(WHITE, dk));
+                tri(v, vec2(bx - 0.15, by + 0.5), vec2(bx - 0.15, by + 3.2), vec2(bx - 1.2, by + 0.5), darker(Color::new(0.95, 0.4, 0.3, 1.0), dk));
+            }
+        }
+        Zone::Bourguet => {
+            // La cathedrale Notre-Dame-du-Bourguet et son clocher carre
+            let st = darker(Color::new(0.86, 0.8, 0.68, 1.0), dk);
+            let st2 = darker(Color::new(0.76, 0.7, 0.58, 1.0), dk);
+            rect(v, x - 8.0, 0.0, x + 4.0, 8.6, st);
+            tri(v, vec2(x - 8.3, 8.6), vec2(x + 4.3, 8.6), vec2(x - 2.0, 11.2), darker(TILE, dk));
+            for k in 0..3 {
+                let wx = x - 6.5 + k as f32 * 3.0;
+                rect(v, wx, 3.4, wx + 0.9, 6.0, window_col(night, k == 1));
+                half_ellipse(v, wx + 0.45, 6.0, 0.45, 0.7, window_col(night, k == 1));
+            }
+            half_ellipse(v, x - 2.0, 0.0, 1.4, 3.6, darker(INK, 1.5));
+            circ(v, vec2(x - 2.0, 7.4), 0.9, window_col(night, true));
+            // le clocher
+            rect(v, x + 4.0, 0.0, x + 8.0, 12.6, st2);
+            for k in 0..2 {
+                rect(v, x + 4.7 + k as f32 * 1.6, 9.4, x + 5.7 + k as f32 * 1.6, 11.8, darker(INK, 1.5));
+            }
+            rect(v, x + 3.8, 12.6, x + 8.2, 13.1, st);
+            tri(v, vec2(x + 4.0, 13.1), vec2(x + 8.0, 13.1), vec2(x + 6.0, 16.0), st);
+            // un etal du marche et son parasol
+            for k in [-13.0f32, -10.5] {
+                rect(v, x + k, 0.0, x + k + 1.8, 1.0, darker(Color::new(0.55, 0.4, 0.25, 1.0), dk));
+                tri(v, vec2(x + k - 0.5, 2.4), vec2(x + k + 2.3, 2.4), vec2(x + k + 0.9, 3.4), darker(if k < -12.0 { Color::new(0.9, 0.3, 0.25, 1.0) } else { Color::new(0.95, 0.8, 0.3, 1.0) }, dk));
+                line(v, vec2(x + k + 0.9, 1.0), vec2(x + k + 0.9, 2.5), 0.08, INK);
+            }
+        }
+        Zone::Citadelle => {
+            // La colline de la Citadelle et la chapelle Notre-Dame-de-Provence
+            let green = darker(Color::new(0.45, 0.56, 0.32, 1.0), dk);
+            half_ellipse(v, x, 0.0, 14.0, 6.8, green);
+            half_ellipse(v, x - 6.0, 0.0, 7.0, 4.0, darker(green, 0.9));
+            for k in 0..8 {
+                // cypres et pins
+                let cx = x - 11.0 + k as f32 * 3.1;
+                let cy = 1.5 + hash(k, 72) * 2.6;
+                tri(v, vec2(cx - 0.4, cy), vec2(cx + 0.4, cy), vec2(cx, cy + 3.0), darker(Color::new(0.18, 0.33, 0.2, 1.0), dk));
+            }
+            for k in 0..5 {
+                let hx = x - 8.0 + k as f32 * 3.6;
+                let hy = 0.6 + hash(k, 71) * 2.6;
+                rect(v, hx, hy, hx + 1.9, hy + 1.5, darker(Color::new(0.9, 0.83, 0.68, 1.0), dk));
+                tri(v, vec2(hx - 0.2, hy + 1.5), vec2(hx + 2.1, hy + 1.5), vec2(hx + 0.95, hy + 2.2), darker(TILE, dk));
+            }
+            // la chapelle octogonale, sa coupole et sa Vierge
+            let up = lowered(v, 4.2);
+            let v = &up;
+            let st = darker(Color::new(0.92, 0.88, 0.78, 1.0), dk);
+            rect(v, x - 2.6, 10.6, x + 2.6, 14.5, st);
+            for k in 0..3 {
+                let wx = x - 1.9 + k as f32 * 1.5;
+                rect(v, wx, 11.6, wx + 0.8, 13.4, darker(INK, 1.6));
+                half_ellipse(v, wx + 0.4, 13.4, 0.4, 0.45, darker(INK, 1.6));
+            }
+            rect(v, x - 2.9, 14.5, x + 2.9, 14.9, darker(st, 0.9));
+            half_ellipse(v, x, 14.9, 2.5, 2.4, darker(Color::new(0.7, 0.72, 0.74, 1.0), dk));
+            rect(v, x - 0.3, 17.2, x + 0.3, 18.2, st);
+            ellipse(v, vec2(x, 19.2), 0.35, 1.0, 0.0, darker(Color::new(0.97, 0.97, 0.95, 1.0), dk));
+            circ(v, vec2(x, 20.4), 0.3, darker(Color::new(0.97, 0.97, 0.95, 1.0), dk));
+        }
+        Zone::Lavande => {
+            // Un borie, des ruches et des cypres au milieu de la lavande
+            let st = darker(Color::new(0.8, 0.77, 0.68, 1.0), dk);
+            half_ellipse(v, x, 1.2, 3.2, 4.4, st);
+            for k in 0..4 {
+                line(v, vec2(x - 2.9 + k as f32 * 0.3, 1.9 + k as f32 * 0.9), vec2(x + 2.9 - k as f32 * 0.3, 1.9 + k as f32 * 0.9), 0.07, darker(st, 0.82));
+            }
+            rect(v, x - 0.6, 1.2, x + 0.6, 3.0, darker(INK, 1.6));
+            for k in [-34.0f32, -22.0, -14.0, 12.0, 20.0, 31.0] {
+                let ch = 6.0 + hash(k as i32, 73) * 4.0;
+                rect(v, x + k - 0.15, 1.2, x + k + 0.15, 2.0, darker(Color::new(0.4, 0.3, 0.2, 1.0), dk));
+                tri(v, vec2(x + k - 0.8, 1.8), vec2(x + k + 0.8, 1.8), vec2(x + k, 1.8 + ch), darker(Color::new(0.18, 0.33, 0.2, 1.0), dk));
+            }
+            for k in 0..5 {
+                let rx = x + 5.5 + k as f32 * 1.1;
+                rect(v, rx, 1.2, rx + 0.8, 2.1, darker([Color::new(0.95, 0.85, 0.4, 1.0), Color::new(0.5, 0.7, 0.9, 1.0), WHITE][(k % 3) as usize], dk));
+                rect(v, rx - 0.08, 2.1, rx + 0.88, 2.25, darker(Color::new(0.5, 0.4, 0.3, 1.0), dk));
+            }
+            for k in [-28.0f32, -9.0, 25.0, 37.0] {
+                draw_olive(v, x + k, 1.2, 4.2 + hash(k as i32, 83) * 1.2, dk);
+            }
+            // les rangs de lavande, au premier plan du champ
+            draw_lavender_rows(v, x, 92.0, dk);
+        }
+        Zone::Oliviers => {
+            // L'oliveraie : un mas, une restanque en pierre seche, des oliviers en rangs
+            let st = darker(Color::new(0.88, 0.8, 0.64, 1.0), dk);
+            rect(v, x - 4.5, 1.6, x + 4.5, 6.4, st);
+            tri(v, vec2(x - 5.0, 6.4), vec2(x + 5.0, 6.4), vec2(x, 8.2), darker(TILE, dk));
+            rect(v, x + 4.5, 1.6, x + 8.0, 4.6, darker(st, 0.92));
+            tri(v, vec2(x + 4.5, 4.6), vec2(x + 8.3, 4.6), vec2(x + 4.5, 5.6), darker(TILE, dk * 0.9));
+            for k in 0..3 {
+                let wx = x - 3.4 + k as f32 * 2.8;
+                rect(v, wx, 4.0, wx + 1.0, 5.6, window_col(night, k == 2));
+                rect(v, wx - 0.45, 4.0, wx - 0.03, 5.6, darker(Color::new(0.6, 0.55, 0.8, 1.0), dk));
+                rect(v, wx + 1.03, 4.0, wx + 1.45, 5.6, darker(Color::new(0.6, 0.55, 0.8, 1.0), dk));
+            }
+            rect(v, x - 0.7, 1.6, x + 0.7, 3.6, darker(Color::new(0.45, 0.4, 0.6, 1.0), dk));
+            // restanque
+            for k in -24..=24 {
+                let wx = x + k as f32 * 1.6;
+                rect(v, wx, 1.0, wx + 1.55, 1.6, darker(if k % 2 == 0 { Color::new(0.8, 0.77, 0.68, 1.0) } else { Color::new(0.72, 0.69, 0.6, 1.0) }, dk));
+            }
+            for k in -6..=6 {
+                if k == 0 || k == 1 {
+                    continue; // le mas est la
+                }
+                let ox = x + k as f32 * 6.2 + hash(k, 84) * 1.5;
+                draw_olive(v, ox, 1.6, 4.6 + hash(k, 85) * 1.6, dk);
+            }
+            for k in -7..=7 {
+                let ox = x + k as f32 * 5.6 + 2.5;
+                draw_olive(v, ox, 0.0, 3.6 + hash(k, 86) * 1.2, dk);
+            }
+        }
+        Zone::Mourres => {
+            // Les Mourres : des champignons de calcaire
+            let rock = darker(LIMESTONE, dk);
+            let rock2 = darker(Color::new(0.78, 0.75, 0.68, 1.0), dk);
+            for k in -5..=5 {
+                let rx = x + k as f32 * 7.0 + hash(k, 75) * 3.0;
+                let hh = 2.5 + hash(k, 76) * 4.5;
+                let wd = 1.0 + hash(k, 77) * 0.8;
+                // le pied, puis le chapeau
+                tri(v, vec2(rx - wd, 0.9), vec2(rx + wd, 0.9), vec2(rx, 0.9 + hh * 1.3), rock2);
+                rect(v, rx - wd * 0.55, 0.9, rx + wd * 0.55, 0.9 + hh, rock2);
+                ellipse(v, vec2(rx, 0.9 + hh), wd * 1.9, 0.85, 0.0, rock);
+                half_ellipse(v, rx, 0.9 + hh, wd * 1.9, 1.3, rock);
+                ellipse(v, vec2(rx, 0.75 + hh), wd * 1.5, 0.35, 0.0, darker(rock2, 0.85));
+                if hash(k, 78) < 0.5 {
+                    half_ellipse(v, rx + 3.2, 0.9, 1.4, 1.0, darker(Color::new(0.4, 0.5, 0.3, 1.0), dk)); // un chene kermes
+                } else {
+                    draw_olive(v, rx + 3.4, 0.6, 3.4 + hash(k, 85), dk);
+                }
+            }
+            draw_lavender_rows(v, x - 24.0, 20.0, dk);
+            draw_lavender_rows(v, x + 22.0, 24.0, dk);
+        }
+        Zone::GrandePoste => {
+            // La Grande Poste d'Alger : trois grands arcs, deux tourelles a coupole
+            let white = darker(Color::new(0.98, 0.98, 0.96, 1.0), dk);
+            let shade2 = darker(Color::new(0.88, 0.88, 0.86, 1.0), dk);
+            let blue = darker(Color::new(0.15, 0.4, 0.7, 1.0), dk);
+            rect(v, x - 10.0, 0.0, x + 10.0, 11.0, white);
+            rect(v, x - 10.2, 11.0, x + 10.2, 11.6, shade2);
+            for k in -1..=1 {
+                let ax = x + k as f32 * 4.6;
+                rect(v, ax - 1.5, 1.2, ax + 1.5, 6.0, darker(INK, 1.6));
+                circ(v, vec2(ax, 6.2), 1.75, darker(INK, 1.6)); // arc outrepasse
+                rect(v, ax - 1.5, 1.2, ax + 1.5, 4.4, window_col(night, true));
+                rect(v, ax - 2.0, 8.4, ax + 2.0, 8.8, blue); // frise de faience
+            }
+            rect(v, x - 8.0, 0.0, x + 8.0, 1.2, shade2); // les marches
+            for k in 0..9 {
+                rect(v, x - 9.5 + k as f32 * 2.2, 11.6, x - 8.6 + k as f32 * 2.2, 12.4, white); // merlons
+            }
+            for sx in [-9.0, 9.0] {
+                rect(v, x + sx - 1.6, 0.0, x + sx + 1.6, 14.0, shade2);
+                rect(v, x + sx - 0.5, 9.5, x + sx + 0.5, 11.5, darker(INK, 1.6));
+                half_ellipse(v, x + sx, 14.0, 1.7, 2.2, white);
+                line(v, vec2(x + sx, 16.2), vec2(x + sx, 17.4), 0.12, darker(GOLD, dk));
+            }
+            for sx in [-14.0f32, 14.0] {
+                draw_palm(v, x + sx, 0.0, 7.0, dk, time);
+            }
+        }
+        Zone::Casbah => {
+            // La mosquee Ketchaoua : grand escalier, trois arcs, deux minarets
+            let white = darker(Color::new(0.97, 0.96, 0.92, 1.0), dk);
+            let shade2 = darker(Color::new(0.86, 0.84, 0.78, 1.0), dk);
+            let blue = darker(Color::new(0.15, 0.45, 0.7, 1.0), dk);
+            for k in 0..4 {
+                rect(v, x - 7.0 + k as f32 * 0.5, k as f32 * 0.5, x + 7.0 - k as f32 * 0.5, k as f32 * 0.5 + 0.5, shade2);
+            }
+            rect(v, x - 5.0, 2.0, x + 5.0, 10.5, white);
+            for k in -1..=1 {
+                let ax = x + k as f32 * 3.0;
+                rect(v, ax - 1.0, 2.0, ax + 1.0, 5.6, darker(INK, 1.6));
+                circ(v, vec2(ax, 5.8), 1.15, darker(INK, 1.6));
+            }
+            rect(v, x - 5.0, 8.2, x + 5.0, 8.6, blue);
+            half_ellipse(v, x, 10.5, 2.6, 2.6, shade2);
+            for sx in [-6.5, 6.5] {
+                rect(v, x + sx - 1.2, 0.0, x + sx + 1.2, 11.6, white);
+                for k in 0..3 {
+                    rect(v, x + sx - 1.2, 3.0 + k as f32 * 3.0, x + sx + 1.2, 3.3 + k as f32 * 3.0, blue);
+                }
+                rect(v, x + sx - 1.5, 11.6, x + sx + 1.5, 12.1, shade2);
+                rect(v, x + sx - 0.8, 12.1, x + sx + 0.8, 13.6, white);
+                half_ellipse(v, x + sx, 13.6, 0.9, 1.0, shade2);
+                line(v, vec2(x + sx, 14.6), vec2(x + sx, 15.5), 0.1, darker(GOLD, dk));
+            }
+        }
+        Zone::Maqam => {
+            // Maqam Echahid : trois palmes de beton qui se rejoignent, face a la baie
+            let conc = darker(Color::new(0.88, 0.87, 0.84, 1.0), dk);
+            let conc2 = darker(Color::new(0.76, 0.75, 0.72, 1.0), dk);
+            half_ellipse(v, x, 0.9, 16.0, 3.0, darker(Color::new(0.45, 0.58, 0.36, 1.0), dk));
+            for (sx, col) in [(-4.6f32, conc2), (4.6, conc2), (0.0, conc)] {
+                // chaque palme : large au pied, effilee et courbee vers le sommet
+                let mut prev = vec2(x + sx, 2.6);
+                for k in 1..=10 {
+                    let t = k as f32 / 10.0;
+                    let p = vec2(x + sx * (1.0 - t).powf(1.7), 2.6 + t * 9.4);
+                    seg(v, prev, p, 1.9 * (1.0 - t * 0.78), col);
+                    prev = p;
+                }
+            }
+            rect(v, x - 0.8, 11.6, x + 0.8, 13.5, conc);
+            half_ellipse(v, x, 13.5, 0.9, 0.8, conc2);
+            line(v, vec2(x, 14.3), vec2(x, 15.5), 0.12, conc2);
+            circ(v, vec2(x, 4.0), 0.45, Color::new(1.0, 0.6, 0.15, 0.6 + 0.4 * night)); // la flamme
+            for sx in [-22.0f32, -13.0, 13.0, 21.0, 30.0] {
+                draw_palm(v, x + sx, 0.9, 5.5 + hash(sx as i32, 79) * 2.5, dk, time);
+            }
+        }
+        Zone::NotreDameAfrique => {
+            // Notre-Dame d'Afrique sur son promontoire
+            let rock = darker(Color::new(0.8, 0.74, 0.6, 1.0), dk);
+            let green = darker(Color::new(0.42, 0.55, 0.32, 1.0), dk);
+            half_ellipse(v, x, 0.0, 14.0, 6.2, rock);
+            half_ellipse(v, x + 6.0, 0.0, 7.0, 3.5, green);
+            half_ellipse(v, x - 7.0, 0.0, 6.0, 3.0, green);
+            for k in 0..6 {
+                let hx = x - 9.0 + k as f32 * 3.4;
+                let hy = 0.6 + hash(k, 71) * 2.2;
+                rect(v, hx, hy, hx + 1.8, hy + 1.5, darker(Color::new(0.98, 0.98, 0.96, 1.0), dk));
+            }
+            let ochre = darker(Color::new(0.93, 0.85, 0.68, 1.0), dk);
+            let blue = darker(Color::new(0.2, 0.45, 0.7, 1.0), dk);
+            let up = lowered(v, 3.8);
+            let v = &up;
+            rect(v, x - 4.0, 9.4, x + 3.0, 13.4, ochre);
+            rect(v, x - 4.0, 12.4, x + 3.0, 12.8, blue); // frise de faience bleue
+            for k in 0..4 {
+                let wx = x - 3.4 + k as f32 * 1.6;
+                rect(v, wx, 10.2, wx + 0.7, 11.8, darker(INK, 1.6));
+                half_ellipse(v, wx + 0.35, 11.8, 0.35, 0.4, darker(INK, 1.6));
+            }
+            // la grande coupole et le clocher
+            rect(v, x - 2.6, 13.4, x + 0.6, 15.0, ochre);
+            half_ellipse(v, x - 1.0, 15.0, 2.0, 2.8, darker(Color::new(0.55, 0.62, 0.66, 1.0), dk));
+            line(v, vec2(x - 1.0, 17.8), vec2(x - 1.0, 19.2), 0.12, darker(GOLD, dk));
+            rect(v, x + 2.2, 9.4, x + 4.2, 18.0, ochre);
+            rect(v, x + 2.2, 15.4, x + 4.2, 15.8, blue);
+            rect(v, x + 2.8, 16.2, x + 3.6, 17.5, darker(INK, 1.6));
+            half_ellipse(v, x + 3.2, 18.0, 1.1, 1.5, darker(Color::new(0.55, 0.62, 0.66, 1.0), dk));
+            line(v, vec2(x + 3.2, 19.5), vec2(x + 3.2, 20.6), 0.1, darker(GOLD, dk));
+        }
+        Zone::Sahara => {
+            // Le Sahara : grandes dunes, une oasis et une caravane
+            let sand = darker(SAND, dk);
+            let sand2 = darker(Color::new(0.86, 0.68, 0.4, 1.0), dk);
+            for k in -4..=4 {
+                let dx = x + k as f32 * 11.0;
+                let dh = 4.0 + hash(k, 82) * 4.0;
+                half_ellipse(v, dx, 0.0, 9.0, dh, sand);
+                half_ellipse(v, dx + 4.0, 0.0, 6.0, dh * 0.7, sand2);
+            }
+            for sx in [-3.0f32, 0.0, 2.5, 5.0] {
+                draw_palm(v, x + sx, 0.4, 5.0 + hash(sx as i32, 79) * 2.5, dk, time);
+            }
+            ellipse(v, vec2(x + 1.0, 0.5), 5.5, 0.5, 0.0, darker(Color::new(0.2, 0.55, 0.7, 1.0), dk));
+            // la caravane, sur la crete
+            let camel = darker(Color::new(0.45, 0.32, 0.2, 1.0), dk);
+            for k in 0..4 {
+                let cx = x - 28.0 + k as f32 * 3.4;
+                let cy = 5.2 + (k as f32 * 1.3).sin() * 0.3;
+                ellipse(v, vec2(cx, cy + 1.3), 1.0, 0.5, 0.0, camel);
+                half_ellipse(v, cx - 0.1, cy + 1.6, 0.45, 0.6, camel); // la bosse
+                line(v, vec2(cx + 0.8, cy + 1.4), vec2(cx + 1.3, cy + 2.3), 0.22, camel);
+                circ(v, vec2(cx + 1.45, cy + 2.35), 0.22, camel);
+                for lx in [-0.6f32, -0.3, 0.4, 0.7] {
+                    let sw = (time * 3.0 + lx * 4.0 + k as f32).sin() * 0.12;
+                    line(v, vec2(cx + lx, cy + 1.1), vec2(cx + lx + sw, cy), 0.12, camel);
+                }
+            }
+        }
+    }
+}
+
+/// La meme vue, decalee de `d` metres vers le bas (pour poser un monument
+/// au sommet d'une colline sans qu'il sorte de l'ecran).
+fn lowered(v: &View, d: f32) -> View {
+    View { cam_x: v.cam_x, cam_y: v.cam_y, s: v.s, ground_sy: v.ground_sy + d * v.s, anchor_x: v.anchor_x, shake: v.shake }
+}
+
+/// Un olivier : tronc noueux, feuillage vert argente.
+fn draw_olive(v: &View, x: f32, y: f32, h: f32, dk: f32) {
+    let trunk = darker(Color::new(0.42, 0.36, 0.3, 1.0), dk);
+    let leaf = darker(Color::new(0.52, 0.62, 0.45, 1.0), dk);
+    let leaf2 = darker(Color::new(0.66, 0.74, 0.6, 1.0), dk);
+    seg(v, vec2(x - 0.1, y), vec2(x + 0.15, y + h * 0.35), 0.5, trunk);
+    seg(v, vec2(x + 0.15, y + h * 0.35), vec2(x - 0.5, y + h * 0.62), 0.3, trunk);
+    seg(v, vec2(x + 0.15, y + h * 0.35), vec2(x + 0.7, y + h * 0.6), 0.3, trunk);
+    for (dx, dy, r) in [(-0.9f32, 0.68f32, 0.95f32), (0.9, 0.66, 1.0), (0.0, 0.85, 1.15), (-0.4, 0.95, 0.7), (0.5, 0.98, 0.7)] {
+        ellipse(v, vec2(x + dx * h * 0.32, y + h * dy), r * h * 0.3, r * h * 0.21, 0.0, leaf);
+    }
+    for (dx, dy) in [(-0.6f32, 0.82f32), (0.3, 0.98), (0.8, 0.76)] {
+        ellipse(v, vec2(x + dx * h * 0.32, y + h * dy), h * 0.13, h * 0.07, 0.0, leaf2);
+    }
+}
+
+/// Un champ de lavande en rangs, vu de face (largeur `w` autour de `x`).
+fn draw_lavender_rows(v: &View, x: f32, w: f32, dk: f32) {
+    let n = (w / 1.9) as i32;
+    for row in (0..3).rev() {
+        for k in -n / 2..=n / 2 {
+            let lx = x + k as f32 * 1.9 + row as f32 * 0.6;
+            let ly = row as f32 * 0.55;
+            let col = if (k + row) % 2 == 0 { LAVENDER } else { Color::new(0.48, 0.36, 0.7, 1.0) };
+            half_ellipse(v, lx, ly, 0.9, 0.95 + hash(k + row * 31, 74) * 0.3, darker(col, dk * (1.0 - row as f32 * 0.07)));
+            half_ellipse(v, lx, ly, 0.9, 0.3, darker(Color::new(0.35, 0.5, 0.3, 1.0), dk));
+        }
+    }
+}
+
+/// Un palmier (les palmes ondulent un peu).
+fn draw_palm(v: &View, x: f32, y: f32, h: f32, dk: f32, time: f32) {
+    let trunk = darker(Color::new(0.5, 0.38, 0.25, 1.0), dk);
+    let leaf = darker(Color::new(0.2, 0.5, 0.25, 1.0), dk);
+    let top = vec2(x + 0.4, y + h);
+    seg(v, vec2(x, y), vec2(x + 0.25, y + h * 0.5), 0.4, trunk);
+    seg(v, vec2(x + 0.25, y + h * 0.5), top, 0.32, trunk);
+    for k in 0..7 {
+        let a = -0.5 + k as f32 * (PI + 1.0) / 6.0 + (time * 1.2 + x).sin() * 0.05;
+        let mid = top + Vec2::from_angle(a) * 1.4;
+        let tip = mid + Vec2::from_angle(a - 0.9 * a.cos().signum()) * 1.3 + vec2(0.0, -0.5);
+        seg(v, top, mid, 0.22, leaf);
+        seg(v, mid, tip, 0.14, leaf);
+    }
+}
+
+/// Facade du Sud. Marseille : crepi ocre ou rose, volets de couleur, tuiles
+/// romaines. Forcalquier : pierre et volets lavande. Alger : murs blancs,
+/// volets bleus et toits en terrasse.
+fn draw_facade_south(v: &View, i: i32, x0: f32, bw: f32, zone: Zone, night: f32) {
+    let dk = 1.0 - 0.6 * night;
+    let city = zone.city();
+    let floors = if zone == Zone::Casbah { 2 + (hash(i, 2) * 3.0) as i32 } else { 3 + (hash(i, 2) * 2.0) as i32 };
+    let fh = 3.0;
+    let top = floors as f32 * fh;
+    let walls: [Color; 5] = match city {
+        City::Forcalquier => [
+            Color::new(0.9, 0.84, 0.7, 1.0),
+            Color::new(0.84, 0.78, 0.66, 1.0),
+            Color::new(0.94, 0.86, 0.62, 1.0),
+            Color::new(0.8, 0.76, 0.68, 1.0),
+            Color::new(0.92, 0.78, 0.6, 1.0),
+        ],
+        City::Algerie => [
+            Color::new(0.98, 0.98, 0.96, 1.0),
+            Color::new(0.94, 0.95, 0.96, 1.0),
+            Color::new(0.97, 0.95, 0.9, 1.0),
+            Color::new(0.92, 0.93, 0.92, 1.0),
+            Color::new(0.99, 0.97, 0.93, 1.0),
+        ],
+        _ => [
+            Color::new(0.95, 0.8, 0.52, 1.0),
+            Color::new(0.94, 0.72, 0.62, 1.0),
+            Color::new(0.97, 0.89, 0.64, 1.0),
+            Color::new(0.96, 0.92, 0.82, 1.0),
+            Color::new(0.9, 0.62, 0.45, 1.0),
+        ],
+    };
+    let shutters: [Color; 4] = match city {
+        City::Forcalquier => [Color::new(0.6, 0.55, 0.8, 1.0), Color::new(0.5, 0.6, 0.72, 1.0), Color::new(0.55, 0.65, 0.5, 1.0), Color::new(0.7, 0.62, 0.82, 1.0)],
+        City::Algerie => [Color::new(0.15, 0.4, 0.75, 1.0), Color::new(0.2, 0.5, 0.8, 1.0), Color::new(0.1, 0.55, 0.6, 1.0), Color::new(0.25, 0.35, 0.7, 1.0)],
+        _ => [Color::new(0.3, 0.5, 0.72, 1.0), Color::new(0.35, 0.56, 0.42, 1.0), Color::new(0.55, 0.5, 0.75, 1.0), Color::new(0.6, 0.3, 0.25, 1.0)],
+    };
+    let wall = darker(walls[((hash(i, 3) * 5.0) as usize).min(4)], dk);
+    let shut = darker(shutters[((hash(i, 9) * 4.0) as usize).min(3)], dk);
+    rect(v, x0, 0.0, x0 + bw - 0.05, top, wall);
+    if city == City::Algerie {
+        // toit en terrasse : acrotere, et parfois une petite coupole ou du linge
+        rect(v, x0 - 0.1, top, x0 + bw + 0.05, top + 0.45, darker(wall, 0.9));
+        if hash(i, 15) < 0.3 {
+            half_ellipse(v, x0 + bw * 0.5, top + 0.45, 1.2, 1.1, wall);
+        } else if hash(i, 15) < 0.6 {
+            rect(v, x0 + 1.0, top + 0.45, x0 + 3.2, top + 1.9, darker(wall, 0.95));
+            rect(v, x0 + 1.7, top + 0.45, x0 + 2.4, top + 1.5, shut);
+        }
+        if zone == Zone::Casbah {
+            // rondins de thuya sous l'encorbellement
+            for k in 0..7 {
+                let rx = x0 + 0.5 + k as f32 * 1.1;
+                line(v, vec2(rx, fh - 0.05), vec2(rx - 0.25, fh - 0.75), 0.1, darker(Color::new(0.5, 0.35, 0.22, 1.0), dk));
+            }
+        }
+    } else {
+        // toit de tuiles, a faible pente
+        let tile = darker(TILE, dk);
+        rect(v, x0 - 0.2, top, x0 + bw + 0.15, top + 0.35, tile);
+        tri(v, vec2(x0 - 0.2, top + 0.35), vec2(x0 + bw + 0.15, top + 0.35), vec2(x0 + bw * 0.5, top + 1.5), darker(tile, 0.9));
+        rect(v, x0 + bw * 0.7, top + 0.6, x0 + bw * 0.7 + 0.5, top + 1.9, darker(wall, 0.85));
+    }
+    for f in 0..floors {
+        for k in 0..3 {
+            let wx = x0 + 1.1 + k as f32 * 2.3;
+            let wy = f as f32 * fh + 0.6;
+            if f == 0 {
+                if matches!(zone, Zone::Canebiere | Zone::Velodrome | Zone::Bourguet | Zone::GrandePoste) {
+                    // boutique avec store raye
+                    rect(v, wx - 0.2, 0.0, wx + 1.4, 2.0, window_col(night, true));
+                    let stripe = if zone == Zone::Velodrome { Color::new(0.2, 0.62, 0.9, 1.0) } else { shutters[((hash(i * 3 + k, 5) * 4.0) as usize).min(3)] };
+                    for b in 0..4 {
+                        let sx = wx - 0.35 + b as f32 * 0.5;
+                        rect(v, sx, 2.0, sx + 0.5, 2.5, darker(if b % 2 == 0 { stripe } else { WHITE }, dk));
+                    }
+                } else {
+                    rect(v, wx, 0.0, wx + 1.0, 2.1, darker(shut, 0.8));
+                    half_ellipse(v, wx + 0.5, 2.1, 0.5, 0.35, darker(shut, 0.8));
+                }
+            } else {
+                if zone == Zone::Casbah {
+                    // petites fenetres a moucharabieh
+                    rect(v, wx + 0.2, wy + 0.5, wx + 0.8, wy + 1.4, shut);
+                    rect(v, wx + 0.3, wy + 0.6, wx + 0.7, wy + 1.3, window_col(night, hash(i * 11 + f * 3 + k, 7) < 0.35));
+                    continue;
+                }
+                rect(v, wx, wy, wx + 1.0, wy + 1.8, window_col(night, hash(i * 11 + f * 3 + k, 7) < 0.35));
+                // volets : ouverts, ou fermes pour la sieste
+                if hash(i * 13 + f * 5 + k, 10) < 0.25 {
+                    rect(v, wx, wy, wx + 1.0, wy + 1.8, shut);
+                    line(v, vec2(wx + 0.5, wy), vec2(wx + 0.5, wy + 1.8), 0.04, darker(shut, 0.7));
+                } else {
+                    rect(v, wx - 0.45, wy, wx - 0.03, wy + 1.8, shut);
+                    rect(v, wx + 1.03, wy, wx + 1.45, wy + 1.8, shut);
+                }
+            }
+        }
+    }
+    // Au Panier, le linge seche aux fenetres
+    if zone == Zone::Panier && hash(i, 8) < 0.7 {
+        let y = fh * 2.0 + 0.4;
+        line(v, vec2(x0 + 0.5, y + 0.3), vec2(x0 + bw - 0.5, y), 0.04, darker(Color::new(0.3, 0.3, 0.3, 1.0), dk));
+        let linen = [WHITE, Color::new(0.9, 0.3, 0.3, 1.0), Color::new(0.3, 0.55, 0.85, 1.0), Color::new(0.98, 0.85, 0.3, 1.0)];
+        for b in 0..6 {
+            let t = (b as f32 + 0.5) / 6.5;
+            let lx = x0 + 0.5 + t * (bw - 1.0);
+            let ly = y + 0.3 - t * 0.3;
+            let c = linen[((hash(i * 7 + b, 12) * 4.0) as usize).min(3)];
+            rect(v, lx, ly - 0.9 - hash(i + b, 14) * 0.4, lx + 0.55, ly, darker(c, dk));
+        }
+    }
+    // Au Velodrome, les drapeaux de l'OM aux balcons
+    if zone == Zone::Velodrome && hash(i, 8) < 0.6 {
+        let y = fh + 0.2;
+        rect(v, x0 + 2.6, y, x0 + 5.2, y + 0.5, darker(Color::new(0.2, 0.62, 0.9, 1.0), dk));
+        rect(v, x0 + 2.6, y - 0.5, x0 + 5.2, y, darker(WHITE, dk));
     }
 }
 
@@ -3706,7 +5290,127 @@ fn draw_kebab(v: &View, c: Vec2, k: f32) {
     }
 }
 
-fn draw_tram(v: &View, t: &Tram, night: f32, time: f32) {
+/// Petite roue a pneu.
+fn tyre(v: &View, c: Vec2, r: f32, spin: f32) {
+    circ(v, c, r, Color::new(0.1, 0.1, 0.1, 1.0));
+    circ(v, c, r * 0.55, Color::new(0.75, 0.75, 0.78, 1.0));
+    let d = Vec2::from_angle(spin) * r * 0.5;
+    line(v, c - d, c + d, r * 0.18, Color::new(0.3, 0.3, 0.32, 1.0));
+    line(v, c - d.perp(), c + d.perp(), r * 0.18, Color::new(0.3, 0.3, 0.32, 1.0));
+}
+
+/// Marseille : le petit train des touristes (pas de rails, il roule sur le quai).
+fn draw_tourist_train(v: &View, x0: f32, night: f32, time: f32) {
+    let dk = 1.0 - 0.4 * night;
+    let white = darker(Color::new(0.97, 0.97, 0.95, 1.0), dk);
+    let blue = darker(Color::new(0.15, 0.5, 0.85, 1.0), dk);
+    let navy = darker(Color::new(0.1, 0.25, 0.5, 1.0), dk);
+    let spin = time * 6.0;
+    // la locomotive, deguisee en loco a vapeur
+    rect(v, x0 + 0.5, 0.45, x0 + 3.6, 1.5, blue);
+    ellipse(v, vec2(x0 + 1.5, 1.45), 1.1, 0.65, 0.0, white);
+    rect(v, x0 + 0.5, 0.45, x0 + 3.6, 0.7, navy);
+    rect(v, x0 + 0.85, 2.0, x0 + 1.25, TRAM_TOP, navy); // cheminee
+    rect(v, x0 + 0.7, TRAM_TOP - 0.2, x0 + 1.4, TRAM_TOP, navy);
+    rect(v, x0 + 2.2, 1.4, x0 + 3.6, TRAM_TOP - 0.15, white); // cabine
+    rect(v, x0 + 2.4, 1.7, x0 + 3.4, 2.5, mix(Color::new(0.2, 0.25, 0.3, 1.0), Color::new(1.0, 0.9, 0.6, 1.0), night * 0.8));
+    rect(v, x0 + 0.6, TRAM_TOP - 0.15, x0 + 3.8, TRAM_TOP, blue);
+    tri(v, vec2(x0, 0.3), vec2(x0 + 0.5, 0.3), vec2(x0 + 0.5, 1.0), navy); // chasse-pigeons
+    circ(v, vec2(x0 + 0.45, 1.5), 0.14, Color::new(1.0, 1.0, 0.8, 1.0));
+    tyre(v, vec2(x0 + 1.1, 0.3), 0.3, spin);
+    tyre(v, vec2(x0 + 3.0, 0.3), 0.3, spin);
+    // un peu de fumee (pour faire vrai)
+    for k in 0..3 {
+        let t = (time * 0.9 + k as f32 * 0.33).fract();
+        circ(v, vec2(x0 + 1.05 + t * 1.6, TRAM_TOP + 0.2 + t * 1.2), 0.15 + t * 0.3, Color::new(1.0, 1.0, 1.0, 0.55 * (1.0 - t)));
+    }
+    // trois wagons ouverts, avec store raye et touristes
+    for w in 0..3 {
+        let wx = x0 + 4.0 + w as f32 * 4.7;
+        line(v, vec2(wx - 0.45, 0.6), vec2(wx, 0.6), 0.1, navy); // attelage
+        rect(v, wx, 0.45, wx + 4.3, 1.25, if w % 2 == 0 { white } else { blue });
+        rect(v, wx, 0.45, wx + 4.3, 0.65, navy);
+        for k in 0..3 {
+            let px = wx + 0.1 + k as f32 * 2.0;
+            rect(v, px, 1.25, px + 0.1, TRAM_TOP - 0.3, navy);
+        }
+        // touristes : une tete, un chapeau ou une casquette
+        for k in 0..4 {
+            let hx = wx + 0.65 + k as f32 * 1.0;
+            let skin = [Color::new(0.95, 0.78, 0.65, 1.0), Color::new(0.8, 0.6, 0.45, 1.0), Color::new(0.98, 0.85, 0.75, 1.0)][((hash(w * 4 + k, 91) * 3.0) as usize).min(2)];
+            let hat = [Color::new(0.95, 0.3, 0.3, 1.0), Color::new(0.98, 0.9, 0.5, 1.0), Color::new(0.3, 0.7, 0.4, 1.0), Color::new(0.95, 0.55, 0.8, 1.0)][((hash(w * 4 + k, 92) * 4.0) as usize).min(3)];
+            let bob = (time * 5.0 + (w * 4 + k) as f32).sin() * 0.03;
+            rect(v, hx - 0.22, 1.25, hx + 0.22, 1.6, darker(hat, dk * 0.85));
+            circ(v, vec2(hx, 1.8 + bob), 0.2, darker(skin, dk));
+            rect(v, hx - 0.28, 1.93 + bob, hx + 0.24, 2.0 + bob, darker(hat, dk));
+            half_ellipse(v, hx, 2.0 + bob, 0.18, 0.14, darker(hat, dk));
+        }
+        // store raye bleu et blanc
+        for k in 0..9 {
+            let sx = wx - 0.1 + k as f32 * 0.5;
+            rect(v, sx, TRAM_TOP - 0.3, sx + 0.5, TRAM_TOP, if k % 2 == 0 { blue } else { white });
+        }
+        tyre(v, vec2(wx + 0.8, 0.28), 0.28, spin);
+        tyre(v, vec2(wx + 3.5, 0.28), 0.28, spin);
+    }
+}
+
+/// Forcalquier : un tracteur et ses remorques de bottes de foin.
+fn draw_hay_tractor(v: &View, x0: f32, night: f32, time: f32) {
+    let dk = 1.0 - 0.4 * night;
+    let green = darker(Color::new(0.2, 0.55, 0.25, 1.0), dk);
+    let green2 = darker(Color::new(0.14, 0.4, 0.18, 1.0), dk);
+    let hay = darker(Color::new(0.93, 0.78, 0.35, 1.0), dk);
+    let hay2 = darker(Color::new(0.82, 0.66, 0.26, 1.0), dk);
+    let spin = time * 4.0;
+    // le tracteur : capot, cabine, pot d'echappement
+    rect(v, x0 + 0.3, 0.7, x0 + 2.4, 1.7, green);
+    rect(v, x0 + 0.3, 0.7, x0 + 2.4, 0.9, green2);
+    rect(v, x0 + 0.2, 0.9, x0 + 0.4, 1.5, Color::new(0.15, 0.15, 0.15, 1.0)); // calandre
+    rect(v, x0 + 1.0, 1.7, x0 + 1.15, TRAM_TOP - 0.3, Color::new(0.2, 0.2, 0.2, 1.0));
+    let puff = (time * 1.4).fract();
+    circ(v, vec2(x0 + 1.1 + puff * 1.2, TRAM_TOP - 0.2 + puff), 0.12 + puff * 0.25, Color::new(0.3, 0.3, 0.3, 0.5 * (1.0 - puff)));
+    rect(v, x0 + 2.2, 0.9, x0 + 4.0, TRAM_TOP - 0.12, green);
+    rect(v, x0 + 2.4, 1.6, x0 + 3.8, 2.55, mix(Color::new(0.55, 0.75, 0.85, 1.0), Color::new(1.0, 0.9, 0.6, 1.0), night * 0.8));
+    rect(v, x0 + 2.0, TRAM_TOP - 0.12, x0 + 4.2, TRAM_TOP, green2);
+    // le paysan et son chapeau de paille
+    circ(v, vec2(x0 + 3.0, 2.05), 0.2, darker(Color::new(0.9, 0.7, 0.55, 1.0), dk));
+    rect(v, x0 + 2.68, 2.2, x0 + 3.32, 2.27, hay2);
+    half_ellipse(v, x0 + 3.0, 2.27, 0.2, 0.16, hay);
+    circ(v, vec2(x0 + 0.35, 1.2), 0.12, Color::new(1.0, 1.0, 0.8, 1.0));
+    tyre(v, vec2(x0 + 0.95, 0.42), 0.42, spin);
+    tyre(v, vec2(x0 + 3.2, 0.8), 0.8, spin * 0.5);
+    // deux remorques chargees de bottes rondes
+    for w in 0..2 {
+        let wx = x0 + 4.6 + w as f32 * 6.8;
+        line(v, vec2(wx - 0.5, 0.6), vec2(wx, 0.6), 0.1, Color::new(0.2, 0.2, 0.2, 1.0));
+        rect(v, wx, 0.55, wx + 6.4, 0.85, darker(Color::new(0.55, 0.3, 0.2, 1.0), dk));
+        for row in 0..2 {
+            for k in 0..6 {
+                let bx = wx + 0.55 + k as f32 * 1.06;
+                let by = 0.85 + 0.51 + row as f32 * 1.02;
+                rect(v, bx - 0.52, by - 0.51, bx + 0.52, by + 0.51, if (k + row) % 2 == 0 { hay } else { hay2 });
+                circ(v, vec2(bx, by), 0.45, if (k + row) % 2 == 0 { hay2 } else { hay });
+                circ(v, vec2(bx, by), 0.25, if (k + row) % 2 == 0 { hay } else { hay2 });
+                circ(v, vec2(bx, by), 0.08, hay2);
+            }
+        }
+        // quelques brins qui depassent
+        for k in 0..8 {
+            let sx = wx + 0.4 + k as f32 * 0.8;
+            line(v, vec2(sx, TRAM_TOP - 0.02), vec2(sx + 0.12, TRAM_TOP + 0.14), 0.03, hay);
+        }
+        tyre(v, vec2(wx + 1.2, 0.36), 0.36, spin);
+        tyre(v, vec2(wx + 5.2, 0.36), 0.36, spin);
+    }
+}
+
+fn draw_tram(v: &View, t: &Tram, night: f32, time: f32, city: City) {
+    match city {
+        City::Marseille => return draw_tourist_train(v, t.x, night, time),
+        City::Forcalquier => return draw_hay_tractor(v, t.x, night, time),
+        _ => {}
+    }
     let x0 = t.x;
     let x1 = t.x + TRAM_LEN;
     let dk = 1.0 - 0.4 * night;
@@ -3747,7 +5451,8 @@ fn draw_tram(v: &View, t: &Tram, night: f32, time: f32) {
     rect(v, x0 + 0.95, 2.62, x0 + 1.55, 2.85, Color::new(0.1, 0.1, 0.1, 1.0));
     let sp = v.p(vec2(x0 + 1.25, 2.73));
     let size = (v.s * 0.22) as u16;
-    comic_text("B", sp.x, sp.y, size.max(10), Color::new(1.0, 0.5, 0.1, 1.0), INK);
+    let sign = if city == City::Algerie { "1" } else { "B" };
+    comic_text(sign, sp.x, sp.y, size.max(10), Color::new(1.0, 0.5, 0.1, 1.0), INK);
     // phare
     let lp = v.p(vec2(x0 + 0.2, 0.9));
     draw_circle(lp.x, lp.y, v.l(0.1), Color::new(1.0, 1.0, 0.8, 1.0));
@@ -3886,6 +5591,143 @@ fn draw_vehicle(v: &View, ve: &Vehicle, night: f32, time: f32) {
     }
 }
 
+/// Le char d'assaut, `ox` = arriere. `driver` : None = a l'arret (trappe
+/// ouverte), Some(blink) = Acaboulette aux commandes.
+fn draw_tank(v: &View, ox: f32, roll: f32, recoil: f32, driver: Option<bool>) {
+    let (green, dark) = match driver {
+        Some(true) => (Color::new(0.75, 0.8, 0.6, 1.0), Color::new(0.5, 0.55, 0.4, 1.0)),
+        _ => (TANK_GREEN, TANK_DARK),
+    };
+    let steel = Color::new(0.14, 0.14, 0.13, 1.0);
+    ellipse(v, vec2(ox + TANK_LEN / 2.0, 0.02), TANK_LEN * 0.6, 0.1, 0.0, Color::new(0.0, 0.0, 0.0, 0.25));
+
+    // Tete du pilote (derriere la tourelle)
+    if driver.is_some() {
+        let hc = vec2(ox + 2.15, 2.4);
+        let hr = 0.32;
+        for ex in [-0.2f32, 0.16] {
+            tri(v, hc + vec2(ex - 0.11, 0.14), hc + vec2(ex + 0.13, 0.2), hc + vec2(ex + 0.02, 0.5), GINGER);
+            tri(v, hc + vec2(ex - 0.05, 0.18), hc + vec2(ex + 0.08, 0.2), hc + vec2(ex + 0.02, 0.4), NOSE);
+        }
+        ellipse(v, hc, hr * 1.12, hr * 0.95, 0.0, GINGER);
+        ellipse(v, hc + vec2(0.18, -0.1), 0.16, 0.12, 0.0, CREAM);
+        tri(v, hc + vec2(0.27, 0.0), hc + vec2(0.35, 0.0), hc + vec2(0.31, -0.06), NOSE);
+        let eye = hc + vec2(0.11, 0.07);
+        ellipse(v, eye, 0.1, 0.11, 0.0, WHITE);
+        ellipse(v, eye + vec2(0.03, 0.0), 0.07, 0.085, 0.0, Color::new(0.45, 0.75, 0.2, 1.0));
+        ellipse(v, eye + vec2(0.04, 0.0), 0.02, 0.065, 0.0, INK);
+        for k in 0..3 {
+            let o = hc + vec2(0.24, -0.07 - k as f32 * 0.03);
+            line(v, o, o + vec2(0.4, 0.08 - k as f32 * 0.09), 0.012, Color::new(1.0, 1.0, 1.0, 0.9));
+        }
+        // casque
+        half_ellipse(v, hc.x - 0.04, hc.y + 0.12, 0.34, 0.24, dark);
+        line(v, hc + vec2(-0.38, 0.12), hc + vec2(0.34, 0.12), 0.05, steel);
+    } else {
+        // trappe ouverte
+        line(v, vec2(ox + 1.85, 2.0), vec2(ox + 1.55, 2.5), 0.09, dark);
+    }
+
+    // Le gros joint, au bec
+    if driver.is_some() {
+        let mouth = vec2(ox + 2.42, 2.27);
+        let tip = vec2(ox, 0.0) + TANK_JOINT_TIP;
+        let d = (tip - mouth).normalize();
+        let n = d.perp();
+        let end = tip - d * 0.06;
+        // un cone : fin au bec, gros au bout
+        tri(v, mouth + n * 0.04, mouth - n * 0.04, end + n * 0.14, Color::new(0.97, 0.96, 0.9, 1.0));
+        tri(v, mouth - n * 0.04, end - n * 0.14, end + n * 0.14, Color::new(0.9, 0.88, 0.8, 1.0));
+        circ(v, end, 0.14, Color::new(0.35, 0.3, 0.25, 1.0));
+        circ(v, tip, 0.1, Color::new(1.0, 0.45 + 0.3 * (roll * 3.0).sin().abs(), 0.1, 1.0));
+    }
+
+    // Lance-missiles, a l'arriere de la tourelle
+    for k in 0..3 {
+        let a = vec2(ox + 0.95 + k as f32 * 0.16, 2.0 + k as f32 * 0.04);
+        let b = a + vec2(0.75, 0.48);
+        line(v, a, b, 0.15, steel);
+        circ(v, b, 0.06, Color::new(0.85, 0.15, 0.1, 1.0));
+    }
+    rect(v, ox + 1.0, 1.85, ox + 1.6, 2.05, dark);
+
+    // Canon
+    let rec = recoil * 0.45;
+    let by = 1.72;
+    rect(v, ox + 2.9 - rec, by - 0.1, ox + 5.5 - rec, by + 0.1, dark);
+    rect(v, ox + 5.3 - rec, by - 0.16, ox + 5.7 - rec, by + 0.16, steel);
+
+    // Tourelle
+    ellipse(v, vec2(ox + 2.2, 1.62), 1.15, 0.5, 0.0, green);
+    rect(v, ox + 1.25, 1.25, ox + 3.15, 1.62, green);
+    ellipse(v, vec2(ox + 3.05, 1.72), 0.2, 0.2, 0.0, dark);
+    rect(v, ox + 1.75, 2.0, ox + 2.55, 2.1, dark); // trappe
+
+    // Caisse
+    rect(v, ox + 0.35, 0.6, ox + 4.2, 1.3, green);
+    tri(v, vec2(ox + 4.2, 0.6), vec2(ox + 4.2, 1.3), vec2(ox + 4.7, 0.75), green);
+    tri(v, vec2(ox + 0.35, 0.6), vec2(ox + 0.35, 1.3), vec2(ox + 0.05, 0.8), green);
+    rect(v, ox + 0.35, 0.6, ox + 4.2, 0.75, dark);
+    // etoile de la 2e DB (on est pas loin de la place de la Victoire)
+    let sp = v.p(vec2(ox + 1.2, 1.02));
+    draw_poly(sp.x, sp.y, 5, v.l(0.17), -90.0, Color::new(0.95, 0.93, 0.84, 0.9));
+
+    // Chenilles
+    rect(v, ox + 0.4, 0.0, ox + 4.2, 0.72, steel);
+    circ(v, vec2(ox + 0.4, 0.36), 0.36, steel);
+    circ(v, vec2(ox + 4.2, 0.36), 0.36, steel);
+    for k in 0..6 {
+        let c = vec2(ox + 0.45 + k as f32 * 0.74, 0.34);
+        circ(v, c, 0.27, Color::new(0.32, 0.34, 0.3, 1.0));
+        circ(v, c, 0.1, steel);
+        let d = Vec2::from_angle(-roll + k as f32) * 0.24;
+        line(v, c - d, c + d, 0.04, steel);
+    }
+    // maillons qui defilent
+    for k in 0..12 {
+        let x = ox + 0.4 + ((k as f32 * 0.33 - roll * 0.25).rem_euclid(3.8));
+        line(v, vec2(x, 0.0), vec2(x, 0.07), 0.05, Color::new(0.3, 0.3, 0.28, 1.0));
+        line(v, vec2(x, 0.65), vec2(x, 0.72), 0.05, Color::new(0.3, 0.3, 0.28, 1.0));
+    }
+}
+
+/// Fleche verte au-dessus du char a l'arret : il faut sauter dedans.
+fn draw_tank_arrow(v: &View, ox: f32, time: f32) {
+    let bob = (time * 5.0).sin() * 0.22;
+    let c = vec2(ox + 2.15, 3.35 + bob);
+    let edge = Color::new(0.03, 0.25, 0.05, 1.0);
+    let fill = Color::new(0.25, 0.9, 0.25, 1.0);
+    for (k, col) in [(1.0f32, edge), (0.78, fill)] {
+        let hw = 0.5 * k;
+        let lift = (1.0 - k) * 0.35;
+        rect(v, c.x - 0.2 * k, c.y + 0.4, c.x + 0.2 * k, c.y + 1.15 - lift * 0.4, col);
+        tri(v, vec2(c.x - hw, c.y + 0.45 - lift * 0.2), vec2(c.x + hw, c.y + 0.45 - lift * 0.2), vec2(c.x, c.y - 0.3 + lift), col);
+    }
+    let sp = v.p(vec2(c.x, c.y + 1.55));
+    comic_text("SAUTE DEDANS !", sp.x, sp.y, (v.l(0.42) as u16).max(12), fill, edge);
+}
+
+fn draw_shell(v: &View, p: Vec2, time: f32) {
+    let fl = 0.9 + (time * 50.0).sin().abs() * 0.7;
+    tri(v, p + vec2(-0.5, 0.2), p + vec2(-0.5, -0.2), p + vec2(-0.5 - fl, 0.0), Color::new(1.0, 0.5, 0.05, 0.85));
+    tri(v, p + vec2(-0.5, 0.12), p + vec2(-0.5, -0.12), p + vec2(-0.5 - fl * 0.6, 0.0), Color::new(1.0, 0.9, 0.3, 0.9));
+    rect(v, p.x - 0.55, p.y - 0.24, p.x + 0.3, p.y + 0.24, Color::new(0.25, 0.26, 0.28, 1.0));
+    ellipse(v, p + vec2(0.3, 0.0), 0.5, 0.24, 0.0, Color::new(0.25, 0.26, 0.28, 1.0));
+    rect(v, p.x - 0.3, p.y - 0.24, p.x - 0.15, p.y + 0.24, Color::new(0.85, 0.65, 0.15, 1.0));
+    line(v, p + vec2(-0.5, 0.14), p + vec2(0.45, 0.14), 0.04, Color::new(0.5, 0.52, 0.55, 1.0));
+}
+
+fn draw_missile(v: &View, m: &Missile, time: f32) {
+    let d = m.vel.normalize_or_zero();
+    let n = d.perp();
+    let (tail, tip) = (m.pos - d * 0.32, m.pos + d * 0.3);
+    let fl = 0.25 + (time * 60.0 + m.age * 9.0).sin().abs() * 0.3;
+    tri(v, tail + n * 0.08, tail - n * 0.08, tail - d * fl, Color::new(1.0, 0.6, 0.1, 0.9));
+    tri(v, tail + n * 0.2, tail - n * 0.2, tail + d * 0.2, Color::new(0.7, 0.1, 0.1, 1.0)); // ailettes
+    seg(v, tail, tip, 0.15, Color::new(0.93, 0.93, 0.95, 1.0));
+    tri(v, tip + n * 0.075, tip - n * 0.075, tip + d * 0.2, Color::new(0.85, 0.15, 0.1, 1.0));
+}
+
 fn draw_critter(v: &View, c: &Critter, time: f32) {
     let p = c.pos;
     let ph = c.phase;
@@ -3919,6 +5761,27 @@ fn draw_critter(v: &View, c: &Critter, time: f32) {
             circ(v, head + vec2(-0.02, 0.02), 0.022, Color::new(0.95, 0.5, 0.1, 1.0));
         }
         Kind::Crs => draw_crs(v, p, 0.0, ph, true),
+        Kind::Gull => {
+            let white = Kind::Gull.color();
+            let grey = Color::new(0.62, 0.66, 0.72, 1.0);
+            let black = Color::new(0.12, 0.12, 0.15, 1.0);
+            let b = p + vec2(0.0, 0.3);
+            let flap = (time * 9.0 + ph).sin();
+            // aile du fond
+            let far = b + vec2(0.12, 0.08 + flap * 0.5);
+            tri(v, b + vec2(-0.12, 0.05), b + vec2(0.2, 0.05), far, darker(grey, 0.85));
+            tri(v, b + vec2(0.3, 0.02), b + vec2(0.58, 0.08), b + vec2(0.55, -0.05), white); // queue
+            ellipse(v, b, 0.36, 0.15, 0.06, white);
+            let head = b + vec2(-0.34, 0.1);
+            circ(v, head, 0.12, white);
+            tri(v, head + vec2(-0.09, 0.04), head + vec2(-0.09, -0.05), head + vec2(-0.3, -0.03), Color::new(1.0, 0.75, 0.1, 1.0));
+            circ(v, head + vec2(-0.03, 0.03), 0.025, black);
+            // aile de devant, au bout noir
+            let tip = b + vec2(0.2, 0.06 + flap * 0.62);
+            let mid = b.lerp(tip, 0.62);
+            tri(v, b + vec2(-0.16, 0.04), b + vec2(0.22, 0.04), tip, grey);
+            tri(v, mid + vec2(-0.06, 0.0), mid + vec2(0.07, 0.0), tip, black);
+        }
         Kind::Rat => {
             let fur = Kind::Rat.color();
             let run = (ph * 18.0).sin();
@@ -3984,12 +5847,123 @@ fn conf() -> Conf {
         window_height: 700,
         high_dpi: true,
         sample_count: 4,
+        icon: window_icon(),
         ..Default::default()
+    }
+}
+
+/// Icone de la fenetre (barre de titre et barre des taches sous Windows).
+fn window_icon() -> Option<miniquad::conf::Icon> {
+    fn rgba<const N: usize>(png: &[u8]) -> Option<[u8; N]> {
+        let img = Image::from_file_with_format(png, Some(ImageFormat::Png)).ok()?;
+        img.bytes.try_into().ok()
+    }
+    Some(miniquad::conf::Icon {
+        small: rgba(include_bytes!("../data/icons/packarch-acaboulette/16.png"))?,
+        medium: rgba(include_bytes!("../data/icons/packarch-acaboulette/32.png"))?,
+        big: rgba(include_bytes!("../data/icons/packarch-acaboulette/64.png"))?,
+    })
+}
+
+/// Bouton de l'ecran de licence ; renvoie vrai s'il vient d'etre clique.
+fn licence_button(label: &str, x: f32, y: f32, w: f32, h: f32, base: Color) -> bool {
+    let (mx, my) = mouse_position();
+    let hover = mx >= x && mx <= x + w && my >= y && my <= y + h;
+    let k = if hover { 1.25 } else { 1.0 };
+    let col = Color::new((base.r * k).min(1.0), (base.g * k).min(1.0), (base.b * k).min(1.0), 1.0);
+    round_rect(x - 3.0, y - 3.0, w + 6.0, h + 6.0, 15.0, Color::new(0.1, 0.0, 0.03, 1.0));
+    round_rect(x, y, w, h, 12.0, col);
+    comic_text(label, x + w / 2.0, y + h / 2.0, 32, WHITE, Color::new(0.1, 0.0, 0.03, 1.0));
+    hover && is_mouse_button_pressed(MouseButton::Left)
+}
+
+const PROJECT_URL: &str = "https://github.com/packarch/packarch-acaboulette";
+
+/// Ouvre une adresse dans le navigateur par defaut.
+fn open_url(url: &str) {
+    #[cfg(windows)]
+    let cmd = std::process::Command::new("explorer").arg(url).spawn();
+    #[cfg(target_os = "macos")]
+    let cmd = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let cmd = std::process::Command::new("xdg-open").arg(url).spawn();
+    let _ = cmd;
+}
+
+/// Lien souligne centre sur l'ecran ; renvoie vrai s'il vient d'etre clique.
+fn licence_link(txt: &str, y: f32, size: u16) -> bool {
+    let dim = measure_text(txt, None, size, 1.0);
+    let x = screen_width() / 2.0 - dim.width / 2.0;
+    let (mx, my) = mouse_position();
+    let hover = mx >= x - 6.0 && mx <= x + dim.width + 6.0 && my >= y - dim.offset_y - 6.0 && my <= y + 10.0;
+    let col = if hover { WHITE } else { Color::new(0.55, 0.8, 1.0, 1.0) };
+    draw_text(txt, x, y, size as f32, col);
+    draw_line(x, y + 5.0, x + dim.width, y + 5.0, 2.0, col);
+    hover && is_mouse_button_pressed(MouseButton::Left)
+}
+
+/// Fenetre de demarrage : la licence, a accepter (vrai) ou refuser (faux).
+async fn licence_screen() -> bool {
+    let lines = [
+        "Copyright (C) 2026 Acaboulette Legrand",
+        "",
+        "Ce jeu est un logiciel libre, distribué sous la licence",
+        "publique générale GNU, version 3 (GPL-3.0) ou ultérieure.",
+        "Tu peux le copier, l'étudier, le modifier et le redistribuer",
+        "selon les termes de cette licence.",
+        "",
+        "Il est fourni SANS AUCUNE GARANTIE, pas même pour les",
+        "pigeons écrabouillés. Le texte complet de la licence se",
+        "trouve dans le fichier COPYING.",
+    ];
+    let mut time = 0.0f32;
+    loop {
+        time += get_frame_time().min(0.1);
+        let w = screen_width();
+        let h = screen_height();
+        comic_rays(Color::new(0.33, 0.05, 0.13, 1.0), Color::new(0.4, 0.07, 0.16, 1.0), time);
+
+        let pw = 720.0f32.min(w - 32.0);
+        let ph = 570.0f32.min(h - 32.0);
+        let px = w / 2.0 - pw / 2.0;
+        let py = h / 2.0 - ph / 2.0;
+        round_rect(px, py, pw, ph, 16.0, Color::new(0.2, 0.03, 0.07, 0.92));
+        comic_text("ACABOULETTE", w / 2.0, py + 58.0, 64, GINGER, Color::new(0.3, 0.05, 0.02, 1.0));
+        centered("Licence", py + 116.0, 28, Color::new(1.0, 0.9, 0.7, 1.0));
+        for (i, l) in lines.iter().enumerate() {
+            let col = if i == 0 { Color::new(1.0, 0.85, 0.2, 1.0) } else { Color::new(1.0, 1.0, 1.0, 0.9) };
+            centered(l, py + 160.0 + i as f32 * 26.0, 22, col);
+        }
+
+        centered("Le code source est sur GitHub :", py + 436.0, 22, Color::new(1.0, 1.0, 1.0, 0.9));
+        if licence_link(PROJECT_URL, py + 464.0, 22) {
+            open_url(PROJECT_URL);
+        }
+
+        let bw = 220.0f32.min((pw - 72.0) / 2.0);
+        let bh = 60.0;
+        let by = py + ph - bh - 28.0;
+        let accept = licence_button("Accepter", w / 2.0 - bw - 16.0, by, bw, bh, Color::new(0.16, 0.55, 0.2, 1.0));
+        let refuse = licence_button("Refuser", w / 2.0 + 16.0, by, bw, bh, Color::new(0.65, 0.12, 0.12, 1.0));
+        let accept = accept || is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter);
+        let refuse = refuse || is_key_pressed(KeyCode::Escape);
+
+        // On attend l'image suivante : le clic ne doit pas aussi lancer la partie.
+        next_frame().await;
+        if refuse {
+            return false;
+        }
+        if accept {
+            return true;
+        }
     }
 }
 
 #[macroquad::main(conf)]
 async fn main() {
+    if !licence_screen().await {
+        return;
+    }
     macroquad::rand::srand(macroquad::miniquad::date::now() as u64);
     let mut game = Game::new(load_record(), true);
     let mut acc = 0.0;
@@ -4018,11 +5992,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn window_icon_decodes() {
+        assert!(window_icon().is_some());
+    }
+
+    #[test]
     fn les_quartiers_tournent_en_boucle() {
         assert!(zone_at(0.0) == Zone::Chartrons);
         assert!(zone_at(ZONE_LEN * 2.5) == Zone::PontDePierre);
-        assert!(zone_at(ZONE_LEN * 7.1) == Zone::Chartrons);
-        assert!(zone_at(-1.0) == Zone::Chaban);
+        // apres Bordeaux, Marseille ; puis retour a Bordeaux
+        assert!(zone_at(ZONE_LEN * 7.1) == Zone::VieuxPort);
+        assert!(zone_at(ZONE_LEN * 12.5) == Zone::Corniche);
+        assert!(zone_at(ZONE_LEN * 13.1) == Zone::Bourguet);
+        assert!(zone_at(ZONE_LEN * 16.1) == Zone::Oliviers);
+        assert!(zone_at(ZONE_LEN * 18.1) == Zone::GrandePoste);
+        assert!(zone_at(ZONE_LEN * 23.1) == Zone::Chartrons);
+        assert!(zone_at(-1.0) == Zone::Sahara);
+        // chaque ville tient d'un seul bloc, dans l'ordre du voyage
+        let order: Vec<City> = ZONES.iter().map(|z| z.city()).collect();
+        let mut blocks = order.clone();
+        blocks.dedup();
+        assert_eq!(blocks, CITIES.to_vec());
+        assert_eq!(City::Marseille.first_zone(), 7);
+        assert_eq!(City::Forcalquier.first_zone(), 13);
+        assert_eq!(City::Algerie.first_zone(), 18);
     }
 
     #[test]
@@ -4031,6 +6024,82 @@ mod tests {
             let h = hash(i, 7);
             assert!((0.0..1.0).contains(&h));
         }
+    }
+
+    #[test]
+    fn la_gravite_finit_toujours_par_gagner() {
+        // Deltaplane : meme en martelant le clic, on ne gagne que quelques
+        // metres et l'aile finit par se replier.
+        for period in [1usize, 6, 24, 60, 120] {
+            let (mut y, mut vy, mut t, mut top) = (0.0f32, 2.0f32, 0.0f32, 0.0f32);
+            let mut steps = 0;
+            while t < GLIDE_MAX {
+                if steps % period == 0 {
+                    vy = vy.max(glide_lift(t));
+                    t += GLIDE_FLARE_COST;
+                }
+                t += DT;
+                vy = (vy - GLIDE_GRAV * DT).max(-glide_sink(t));
+                y += vy * DT;
+                top = top.max(y);
+                steps += 1;
+            }
+            assert!(steps as f32 * DT <= GLIDE_MAX, "le vol dure trop longtemps");
+            assert!(top < 5.0, "clic toutes les {period} images : +{top} m");
+        }
+        // Sans rien toucher, on descend tout du long.
+        assert!(glide_sink(0.0) > 0.0 && glide_sink(GLIDE_MAX) > glide_sink(0.0));
+        assert_eq!(glide_lift(GLIDE_MAX), 0.0);
+    }
+
+    #[test]
+    fn le_char_pulverise_le_tram() {
+        let mut g = Game::new(0, false);
+        g.phase = Phase::Running;
+        g.critters.clear();
+        g.pos = vec2(1000.0, 0.0);
+        g.next_spawn = 1.0e9; // rien d'autre sur la route
+        g.tank_spots.push(TankSpot { x: 1004.0 });
+        // on court dans le char sans sauter : il ne se passe rien
+        for _ in 0..120 {
+            g.step(DT);
+        }
+        assert_eq!(g.tank, 0.0);
+        // en sautant dedans, on le prend
+        g.tank_spots.push(TankSpot { x: g.pos.x + 3.0 });
+        g.vy = JUMP_V;
+        g.on_ground = false;
+        for _ in 0..120 {
+            g.step(DT);
+        }
+        assert!(g.tank > 0.0 && g.on_ground && g.pos.y == 0.0);
+        // un obus pulverise le tram d'en face, un autre tram est pulverise au contact
+        g.trams.push(Tram { x: g.pos.x + 12.0, warned: true, rode: false });
+        g.fire_shell();
+        for _ in 0..120 {
+            g.step(DT);
+        }
+        assert!(g.trams.is_empty() && g.shells.is_empty());
+        g.trams.push(Tram { x: g.pos.x + 6.0, warned: true, rode: false });
+        for _ in 0..240 {
+            g.step(DT);
+        }
+        assert!(g.trams.is_empty() && g.phase == Phase::Running && g.lives == LIVES);
+        // les missiles vont chercher les bestioles, meme les mouettes
+        g.spawn_critter(Kind::Pigeon, g.pos.x + 9.0);
+        g.spawn_critter(Kind::Gull, g.pos.x + 12.0);
+        g.fire_missiles();
+        assert_eq!(g.missiles.len(), MISSILE_N);
+        for _ in 0..300 {
+            g.step(DT);
+        }
+        assert!(g.critters.is_empty() && g.missiles.is_empty());
+        assert_eq!(g.kills[Kind::Gull as usize], 1);
+        // le plein ne dure pas : Acaboulette finit par en ressortir, entier
+        for _ in 0..(TANK_TIME / DT) as usize {
+            g.step(DT);
+        }
+        assert!(g.tank == 0.0 && g.phase == Phase::Running);
     }
 
     #[test]
